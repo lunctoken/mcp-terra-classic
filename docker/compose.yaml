@@ -1,0 +1,17 @@
+services:
+  terra-classic-mcp:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      TERRA_CLASSIC_LCD_URL: ${TERRA_CLASSIC_LCD_URL:-https://terra-classic-lcd.publicnode.com}
+      TERRA_CLASSIC_MCP_ALLOWED_HOSTS: 127.0.0.1:*,localhost:*,terra-classic-mcp:*
+    ports:
+      - "127.0.0.1:8000:8000"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 100
+    mem_limit: 256m
