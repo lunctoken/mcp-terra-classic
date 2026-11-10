@@ -2,7 +2,7 @@
 
 A client-independent, read-only [Model Context Protocol](https://modelcontextprotocol.io/) server for the Terra Classic blockchain. The same five tools run over local `stdio` or Streamable HTTP at `/mcp`.
 
-This project contains the server itself. Client configuration and optional skills are integration layers; no client plugin is required to use the server. The layout is inspired by [Aave Skills](https://github.com/aave/skills), whose client integrations point to an independent MCP endpoint.
+This project contains the server itself. Client configuration and optional skills are integration layers; no client plugin is required to use the server.
 
 ## Tools
 
