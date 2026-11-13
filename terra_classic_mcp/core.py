@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import os
 import re
@@ -10,11 +11,21 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
+from . import __version__
+
 DEFAULT_LCD_URL = "https://terra-classic-lcd.publicnode.com"
 MAX_QUERY_BYTES = 64 * 1024
 MAX_LCD_BYTES = 4 * 1024 * 1024
 TX_HASH_RE = re.compile(r"^[A-Fa-f0-9]{64}$")
 BECH32_ALPHABET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+PROPOSAL_STATUSES = {
+    "all": "",
+    "voting": "PROPOSAL_STATUS_VOTING_PERIOD",
+    "deposit": "PROPOSAL_STATUS_DEPOSIT_PERIOD",
+    "passed": "PROPOSAL_STATUS_PASSED",
+    "rejected": "PROPOSAL_STATUS_REJECTED",
+    "failed": "PROPOSAL_STATUS_FAILED",
+}
 
 
 class TerraError(Exception):
@@ -71,6 +82,58 @@ def require_address(value: str) -> str:
     return value
 
 
+def require_account_address(value: str) -> str:
+    address = require_address(value)
+    if len(address) != 44:
+        raise TerraError("Expected a 44-character Terra Classic account address")
+    return address
+
+
+def require_page_key(value: str) -> str:
+    if not isinstance(value, str) or len(value) > 512:
+        raise TerraError("Invalid pagination key")
+    if value:
+        try:
+            if not base64.b64decode(value, validate=True):
+                raise TerraError("Invalid pagination key")
+        except (ValueError, binascii.Error) as exc:
+            raise TerraError("Invalid pagination key") from exc
+    return value
+
+
+def next_page_key(payload: dict) -> str | None:
+    pagination = payload.get("pagination")
+    if not isinstance(pagination, dict):
+        raise TerraError("Invalid LCD pagination")
+    key = pagination.get("next_key")
+    if key is None or key == "":
+        return None
+    return require_page_key(key)
+
+
+def require_page_limit(value: int) -> int:
+    if type(value) is not int or not 1 <= value <= 20:
+        raise TerraError("limit must be an integer between 1 and 20")
+    return value
+
+
+def _coins(value: object) -> list[dict[str, str]]:
+    if not isinstance(value, list) or len(value) > 200:
+        raise TerraError("Invalid LCD coin list")
+    coins = []
+    for item in value:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("denom"), str)
+            or not item["denom"]
+            or not isinstance(item.get("amount"), str)
+            or not item["amount"]
+        ):
+            raise TerraError("Invalid LCD coin list")
+        coins.append({"denom": item["denom"], "amount": item["amount"]})
+    return coins
+
+
 def require_tx_hash(value: str) -> str:
     if not isinstance(value, str) or not TX_HASH_RE.fullmatch(value):
         raise TerraError("Transaction hash must contain 64 hexadecimal characters")
@@ -100,7 +163,7 @@ class LcdClient:
         request = Request(
             self.base_url + path,
             method="GET",
-            headers={"Accept": "application/json", "User-Agent": "terra-classic-mcp/0.1"},
+            headers={"Accept": "application/json", "User-Agent": f"terra-classic-mcp/{__version__}"},
         )
         try:
             with self.opener.open(request, timeout=15) as response:
@@ -218,3 +281,132 @@ class LcdClient:
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise TerraError("Invalid validator response") from exc
         return {"status": "BOND_STATUS_BONDED", "validator_count": len(ranked), "validators": validators}
+
+    def delegations(self, address: str, limit: int = 20, page_key: str = "") -> dict:
+        address = require_account_address(address)
+        limit = require_page_limit(limit)
+        page_key = require_page_key(page_key)
+        path = f"/cosmos/staking/v1beta1/delegations/{quote(address, safe='')}?pagination.limit={limit}"
+        if page_key:
+            path += "&pagination.key=" + quote(page_key, safe="")
+        payload = self.request(path)
+        if not isinstance(payload, dict) or not isinstance(payload.get("delegation_responses"), list):
+            raise TerraError("Invalid delegation response")
+        items = payload["delegation_responses"]
+        if len(items) > limit:
+            raise TerraError("Invalid delegation response")
+        delegations = []
+        for item in items:
+            try:
+                validator = item["delegation"]["validator_address"]
+                balance = _coins([item["balance"]])[0]
+            except (KeyError, TypeError, IndexError) as exc:
+                raise TerraError("Invalid delegation response") from exc
+            if not isinstance(validator, str) or not validator.startswith("terravaloper1"):
+                raise TerraError("Invalid delegation response")
+            delegations.append({"validator_address": validator, "balance": balance})
+        return {"address": address, "delegations": delegations, "next_key": next_page_key(payload)}
+
+    def unbonding_delegations(self, address: str, limit: int = 20, page_key: str = "") -> dict:
+        address = require_account_address(address)
+        limit = require_page_limit(limit)
+        page_key = require_page_key(page_key)
+        path = f"/cosmos/staking/v1beta1/delegators/{quote(address, safe='')}/unbonding_delegations?pagination.limit={limit}"
+        if page_key:
+            path += "&pagination.key=" + quote(page_key, safe="")
+        payload = self.request(path)
+        if not isinstance(payload, dict) or not isinstance(payload.get("unbonding_responses"), list):
+            raise TerraError("Invalid unbonding response")
+        items = payload["unbonding_responses"]
+        if len(items) > limit:
+            raise TerraError("Invalid unbonding response")
+        unbonding = []
+        for item in items:
+            if not isinstance(item, dict) or not isinstance(item.get("validator_address"), str) or not item["validator_address"].startswith("terravaloper1"):
+                raise TerraError("Invalid unbonding response")
+            entries = item.get("entries")
+            if not isinstance(entries, list) or len(entries) > 100:
+                raise TerraError("Invalid unbonding response")
+            compact_entries = []
+            for entry in entries:
+                if not isinstance(entry, dict) or any(not isinstance(entry.get(key), str) or not entry[key] for key in ("balance", "completion_time")):
+                    raise TerraError("Invalid unbonding response")
+                compact_entries.append({"balance": entry["balance"], "completion_time": entry["completion_time"]})
+            unbonding.append({"validator_address": item["validator_address"], "entries": compact_entries})
+        return {"address": address, "unbonding": unbonding, "next_key": next_page_key(payload)}
+
+    def staking_rewards(self, address: str) -> dict:
+        address = require_account_address(address)
+        path = f"/cosmos/distribution/v1beta1/delegators/{quote(address, safe='')}/rewards"
+        payload = self.request(path)
+        if not isinstance(payload, dict) or not isinstance(payload.get("rewards"), list) or len(payload["rewards"]) > 200:
+            raise TerraError("Invalid staking rewards response")
+        rewards = []
+        for item in payload["rewards"]:
+            if not isinstance(item, dict) or not isinstance(item.get("validator_address"), str) or not item["validator_address"].startswith("terravaloper1"):
+                raise TerraError("Invalid staking rewards response")
+            rewards.append({"validator_address": item["validator_address"], "reward": _coins(item.get("reward"))})
+        return {"address": address, "rewards": rewards, "total": _coins(payload.get("total"))}
+
+    def governance_proposals(self, status: str = "all", limit: int = 10, page_key: str = "") -> dict:
+        if not isinstance(status, str) or status not in PROPOSAL_STATUSES:
+            raise TerraError("Invalid proposal status")
+        limit = require_page_limit(limit)
+        page_key = require_page_key(page_key)
+        path = f"/cosmos/gov/v1/proposals?pagination.limit={limit}&pagination.reverse=true"
+        if status != "all":
+            path += "&proposal_status=" + PROPOSAL_STATUSES[status]
+        if page_key:
+            path += "&pagination.key=" + quote(page_key, safe="")
+        payload = self.request(path)
+        if not isinstance(payload, dict) or not isinstance(payload.get("proposals"), list):
+            raise TerraError("Invalid governance proposals response")
+        items = payload["proposals"]
+        if len(items) > limit:
+            raise TerraError("Invalid governance proposals response")
+        proposals = []
+        for item in items:
+            if not isinstance(item, dict) or any(not isinstance(item.get(key), str) for key in ("id", "title", "status", "voting_end_time")):
+                raise TerraError("Invalid governance proposals response")
+            proposals.append({key: item[key] for key in ("id", "title", "status", "voting_end_time")})
+        return {"status_filter": status, "proposals": proposals, "next_key": next_page_key(payload)}
+
+    def governance_proposal(self, proposal_id: int) -> dict:
+        if type(proposal_id) is not int or not 1 <= proposal_id <= 9223372036854775807:
+            raise TerraError("Invalid proposal ID")
+        payload = self.request(f"/cosmos/gov/v1/proposals/{proposal_id}")
+        if not isinstance(payload, dict) or not isinstance(payload.get("proposal"), dict):
+            raise TerraError("Invalid governance proposal response")
+        item = payload["proposal"]
+        fields = ("id", "title", "summary", "status", "submit_time", "voting_start_time", "voting_end_time")
+        if any(not isinstance(item.get(key), str) for key in fields) or item["id"] != str(proposal_id):
+            raise TerraError("Invalid governance proposal response")
+        tally_kind = "none"
+        tally = None
+        if item["status"] == "PROPOSAL_STATUS_VOTING_PERIOD":
+            current = self.request(f"/cosmos/gov/v1/proposals/{proposal_id}/tally")
+            if not isinstance(current, dict):
+                raise TerraError("Invalid governance tally response")
+            tally = current.get("tally")
+            tally_kind = "current"
+        elif item["status"] in {"PROPOSAL_STATUS_PASSED", "PROPOSAL_STATUS_REJECTED", "PROPOSAL_STATUS_FAILED"}:
+            tally = item.get("final_tally_result")
+            tally_kind = "final"
+        if tally_kind != "none":
+            keys = ("yes_count", "abstain_count", "no_count", "no_with_veto_count")
+            if not isinstance(tally, dict) or any(not isinstance(tally.get(key), str) for key in keys):
+                raise TerraError("Invalid governance tally response")
+            tally = {key: tally[key] for key in keys}
+        summary = item["summary"]
+        return {
+            "proposal_id": item["id"],
+            "title": item["title"],
+            "summary": summary[:2000],
+            "summary_truncated": len(summary) > 2000,
+            "status": item["status"],
+            "submit_time": item["submit_time"],
+            "voting_start_time": item["voting_start_time"],
+            "voting_end_time": item["voting_end_time"],
+            "tally_kind": tally_kind,
+            "tally": tally,
+        }

@@ -16,3 +16,5 @@ To serve a public HTTPS hostname, place a reverse proxy or gateway in front of t
 Do not put an upstream URL, key, seed phrase or wallet credential in client-facing tool arguments. A tunnel can make a private local server reachable to a supported remote client without publishing an open port; the tunnel is a deployment option, not a server dependency.
 
 The server's results are compact summaries. Native balance results expose `has_more` when the LCD has another page. Transaction results include status, gas and message types rather than the entire transaction payload. Validator results fail if the bonded set cannot be fully fetched, avoiding a misleading voting-power percentage.
+
+Delegation and governance list tools expose an opaque `next_key` cursor. Pass that value as `page_key` to continue; a missing key means there is no next page. Staking reward amounts are decimal base units and are not historical returns or APR estimates. Governance proposal details use a current tally during voting and the final tally after voting. Proposal summaries are capped at 2,000 characters and mark truncation explicitly.

@@ -1,6 +1,6 @@
 # Terra Classic MCP
 
-A client-independent, read-only [Model Context Protocol](https://modelcontextprotocol.io/) server for the Terra Classic blockchain. The same five tools run over local `stdio` or Streamable HTTP at `/mcp`.
+A client-independent, read-only [Model Context Protocol](https://modelcontextprotocol.io/) server for the Terra Classic blockchain. The same ten tools run over local `stdio` or Streamable HTTP at `/mcp`.
 
 This project contains the server itself. Client configuration and optional skills are integration layers; no client plugin is required to use the server.
 
@@ -11,10 +11,17 @@ This project contains the server itself. Client configuration and optional skill
 | `terra_get_chain_status` | Chain ID, latest block height, time and hash |
 | `terra_get_validators` | Top bonded validators, voting power and commission |
 | `terra_get_balance` | Native bank balances for a Terra address |
+| `terra_get_delegations` | Active staking delegations for an account |
+| `terra_get_unbonding_delegations` | Delegations being unbonded and their completion times |
+| `terra_get_staking_rewards` | Accrued, unwithdrawn rewards by validator and total |
+| `terra_get_governance_proposals` | Recent proposals with a status filter |
+| `terra_get_governance_proposal` | One proposal with its current or final vote tally |
 | `terra_get_transaction` | Compact transaction status and message types |
 | `terra_query_contract` | Read-only CosmWasm smart query |
 
 All tools publish input and output schemas, structured JSON results and MCP read-only annotations. They never accept a caller-selected LCD URL.
+
+Delegation and proposal lists return up to 20 entries per page. If `next_key` is present, pass it unchanged as `page_key` to read the next page. Staking balances are chain base units; reward amounts are decimal base units and do not represent an APR. Governance tally counts are voting power, not voter counts.
 
 ## Install and run
 

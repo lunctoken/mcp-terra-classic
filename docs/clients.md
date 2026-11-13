@@ -37,7 +37,7 @@ args = ["/absolute/path/to/mcp-terra-classic/server.py"]
 
 ## ChatGPT
 
-ChatGPT needs a reachable HTTPS `/mcp` endpoint or a supported Secure MCP Tunnel for a local server. In **ChatGPT Plugins**, choose **Add custom MCP server**, enter a name and the endpoint or tunnel, configure authentication, then create and install the plugin. The five tools come from this server; the ChatGPT plugin is only a connection layer. [ChatGPT custom MCP guide](https://developers.openai.com/api/docs/guides/custom-mcp-server).
+ChatGPT needs a reachable HTTPS `/mcp` endpoint or a supported Secure MCP Tunnel for a local server. In **ChatGPT Plugins**, choose **Add custom MCP server**, enter a name and the endpoint or tunnel, configure authentication, then create and install the plugin. The tools come from this server; the ChatGPT plugin is only a connection layer. [ChatGPT custom MCP guide](https://developers.openai.com/api/docs/guides/custom-mcp-server).
 
 ## Claude Code
 
@@ -80,4 +80,4 @@ Use one of these connection forms:
 - `stdio`: executable `/absolute/path/to/.venv/bin/python`, argument `/absolute/path/to/mcp-terra-classic/server.py`.
 - Streamable HTTP: `https://YOUR_DOMAIN/mcp`, or `http://127.0.0.1:8000/mcp` from the same machine.
 
-After connection, list tools and check that all five `terra_` names appear before calling one. The [MCP transport specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports) describes both transports.
+After connection, list tools and check that all ten `terra_` names appear before calling one. The [MCP transport specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports) describes both transports.

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Callable, TypeVar
+from typing import Annotated, Any, Callable, Literal, TypeVar
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -10,7 +10,17 @@ from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import __version__
-from .core import MAX_QUERY_BYTES, LcdClient, TerraError, require_address, require_query, require_tx_hash
+from .core import (
+    MAX_QUERY_BYTES,
+    LcdClient,
+    TerraError,
+    require_account_address,
+    require_address,
+    require_page_key,
+    require_page_limit,
+    require_query,
+    require_tx_hash,
+)
 
 
 class Result(BaseModel):
@@ -67,6 +77,77 @@ class Validators(Result):
     validators: list[Validator]
 
 
+class Delegation(Result):
+    validator_address: str
+    balance: Coin
+
+
+class Delegations(Result):
+    address: str
+    delegations: list[Delegation]
+    next_key: str | None
+
+
+class UnbondingEntry(Result):
+    balance: str
+    completion_time: str
+
+
+class UnbondingDelegation(Result):
+    validator_address: str
+    entries: list[UnbondingEntry]
+
+
+class UnbondingDelegations(Result):
+    address: str
+    unbonding: list[UnbondingDelegation]
+    next_key: str | None
+
+
+class ValidatorReward(Result):
+    validator_address: str
+    reward: list[Coin]
+
+
+class StakingRewards(Result):
+    address: str
+    rewards: list[ValidatorReward]
+    total: list[Coin]
+
+
+class GovernanceProposalSummary(Result):
+    id: str
+    title: str
+    status: str
+    voting_end_time: str
+
+
+class GovernanceProposals(Result):
+    status_filter: str
+    proposals: list[GovernanceProposalSummary]
+    next_key: str | None
+
+
+class GovernanceTally(Result):
+    yes_count: str
+    abstain_count: str
+    no_count: str
+    no_with_veto_count: str
+
+
+class GovernanceProposal(Result):
+    proposal_id: str
+    title: str
+    summary: str
+    summary_truncated: bool
+    status: str
+    submit_time: str
+    voting_start_time: str
+    voting_end_time: str
+    tally_kind: Literal["none", "current", "final"]
+    tally: GovernanceTally | None
+
+
 READ_ONLY = ToolAnnotations(
     readOnlyHint=True,
     destructiveHint=False,
@@ -78,6 +159,11 @@ ALLOWED_ARGUMENTS = {
     "terra_get_chain_status": frozenset(),
     "terra_get_validators": frozenset({"limit"}),
     "terra_get_balance": frozenset({"address"}),
+    "terra_get_delegations": frozenset({"address", "limit", "page_key"}),
+    "terra_get_unbonding_delegations": frozenset({"address", "limit", "page_key"}),
+    "terra_get_staking_rewards": frozenset({"address"}),
+    "terra_get_governance_proposals": frozenset({"status", "limit", "page_key"}),
+    "terra_get_governance_proposal": frozenset({"proposal_id"}),
     "terra_get_transaction": frozenset({"tx_hash"}),
     "terra_query_contract": frozenset({"contract", "query_msg"}),
 }
@@ -150,6 +236,62 @@ def build_server(client: LcdClient | None = None) -> TerraMCPServer:
         address: Annotated[str, Field(min_length=44, max_length=64, description="terra1 Bech32 address (44 or 64 characters)")],
     ) -> Balance:
         return _read(lambda: lcd.balance(require_address(address)), Balance)
+
+    @server.tool(
+        title="Terra Classic delegations",
+        description="Read active staking delegations for a terra1 account. Amounts are base units; pass next_key as page_key for more.",
+        annotations=READ_ONLY,
+    )
+    def terra_get_delegations(
+        address: Annotated[str, Field(min_length=44, max_length=44, description="44-character terra1 account address")],
+        limit: Annotated[int, Field(strict=True, ge=1, le=20, description="Delegations per page (1–20)")] = 20,
+        page_key: Annotated[str, Field(max_length=512, description="Opaque next_key from a previous response; empty for first page")] = "",
+    ) -> Delegations:
+        return _read(lambda: lcd.delegations(require_account_address(address), require_page_limit(limit), require_page_key(page_key)), Delegations)
+
+    @server.tool(
+        title="Terra Classic unbonding delegations",
+        description="Read staking delegations being unbonded, with remaining base-unit amounts and completion times. Pass next_key as page_key for more.",
+        annotations=READ_ONLY,
+    )
+    def terra_get_unbonding_delegations(
+        address: Annotated[str, Field(min_length=44, max_length=44, description="44-character terra1 account address")],
+        limit: Annotated[int, Field(strict=True, ge=1, le=20, description="Validators per page (1–20)")] = 20,
+        page_key: Annotated[str, Field(max_length=512, description="Opaque next_key from a previous response; empty for first page")] = "",
+    ) -> UnbondingDelegations:
+        return _read(lambda: lcd.unbonding_delegations(require_account_address(address), require_page_limit(limit), require_page_key(page_key)), UnbondingDelegations)
+
+    @server.tool(
+        title="Terra Classic staking rewards",
+        description="Read currently accrued, unwithdrawn delegator rewards by validator and total. Amounts are decimal base units, not APR.",
+        annotations=READ_ONLY,
+    )
+    def terra_get_staking_rewards(
+        address: Annotated[str, Field(min_length=44, max_length=44, description="44-character terra1 account address")],
+    ) -> StakingRewards:
+        return _read(lambda: lcd.staking_rewards(require_account_address(address)), StakingRewards)
+
+    @server.tool(
+        title="Terra Classic governance proposals",
+        description="List recent governance proposals and their statuses. Pass next_key as page_key for more; use the detail tool for tally.",
+        annotations=READ_ONLY,
+    )
+    def terra_get_governance_proposals(
+        status: Annotated[Literal["all", "voting", "deposit", "passed", "rejected", "failed"], Field(description="Proposal status filter")] = "all",
+        limit: Annotated[int, Field(strict=True, ge=1, le=20, description="Proposals per page (1–20)")] = 10,
+        page_key: Annotated[str, Field(max_length=512, description="Opaque next_key from a previous response; empty for first page")] = "",
+    ) -> GovernanceProposals:
+        return _read(lambda: lcd.governance_proposals(status, require_page_limit(limit), require_page_key(page_key)), GovernanceProposals)
+
+    @server.tool(
+        title="Terra Classic governance proposal",
+        description="Read one proposal, a bounded summary and its current or final vote tally. Tally counts are voting power in base units.",
+        annotations=READ_ONLY,
+    )
+    def terra_get_governance_proposal(
+        proposal_id: Annotated[int, Field(strict=True, ge=1, le=9223372036854775807, description="Positive on-chain proposal ID")],
+    ) -> GovernanceProposal:
+        return _read(lambda: lcd.governance_proposal(proposal_id), GovernanceProposal)
 
     @server.tool(
         title="Terra Classic transaction",
