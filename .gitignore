@@ -154,6 +154,7 @@ activemq-data/
 .env
 .envrc
 .venv
+mcp-tokens*.json
 env/
 venv/
 ENV/

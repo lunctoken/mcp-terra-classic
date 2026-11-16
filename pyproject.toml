@@ -1,15 +1,15 @@
 [build-system]
-requires = ["setuptools>=75"]
+requires = ["setuptools==84.2.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "terra-classic-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "Read-only, client-independent MCP server for Terra Classic"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
-dependencies = ["mcp>=2.2,<3"]
+dependencies = ["mcp>=2.2,<3", "typing-extensions>=4.13,<5"]
 
 [project.optional-dependencies]
 test = ["pytest>=8,<10"]

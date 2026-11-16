@@ -5,7 +5,18 @@ services:
       dockerfile: docker/Dockerfile
     environment:
       TERRA_CLASSIC_LCD_URL: ${TERRA_CLASSIC_LCD_URL:-https://terra-classic-lcd.publicnode.com}
-      TERRA_CLASSIC_MCP_ALLOWED_HOSTS: 127.0.0.1:*,localhost:*,terra-classic-mcp:*
+      TERRA_CLASSIC_LCD_ALLOWED_HOSTS: ${TERRA_CLASSIC_LCD_ALLOWED_HOSTS:-terra-classic-lcd.publicnode.com}
+      TERRA_CLASSIC_SECONDARY_LCD_URL: ${TERRA_CLASSIC_SECONDARY_LCD_URL:-}
+      TERRA_CLASSIC_SECONDARY_LCD_ALLOWED_HOSTS: ${TERRA_CLASSIC_SECONDARY_LCD_ALLOWED_HOSTS:-}
+      TERRA_CLASSIC_SECONDARY_LCD_SOURCE_LABEL: ${TERRA_CLASSIC_SECONDARY_LCD_SOURCE_LABEL:-secondary operator-configured LCD}
+      TERRA_CLASSIC_CW20_CONTRACTS: ${TERRA_CLASSIC_CW20_CONTRACTS:-}
+      TERRA_CLASSIC_EXPECTED_CHAIN_ID: ${TERRA_CLASSIC_EXPECTED_CHAIN_ID:-columbus-5}
+      TERRA_CLASSIC_MCP_AUTH_MODE: bearer
+      TERRA_CLASSIC_MCP_TOKENS_FILE: /run/secrets/mcp_tokens
+      TERRA_CLASSIC_MCP_ALLOWED_HOSTS: ${TERRA_CLASSIC_MCP_ALLOWED_HOSTS:-127.0.0.1:*,localhost:*,terra-classic-mcp:*}
+      TERRA_CLASSIC_MCP_ALLOWED_ORIGINS: ${TERRA_CLASSIC_MCP_ALLOWED_ORIGINS:-http://127.0.0.1:*,http://localhost:*}
+    secrets:
+      - mcp_tokens
     ports:
       - "127.0.0.1:8000:8000"
     read_only: true
@@ -15,3 +26,14 @@ services:
       - ALL
     pids_limit: 100
     mem_limit: 256m
+    cpus: 1.0
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=15).read()"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 30s
+
+secrets:
+  mcp_tokens:
+    file: ${TERRA_CLASSIC_MCP_TOKENS_FILE:?Set TERRA_CLASSIC_MCP_TOKENS_FILE to an operator-owned JSON credentials file}

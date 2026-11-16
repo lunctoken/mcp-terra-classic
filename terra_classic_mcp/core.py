@@ -4,20 +4,39 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
+from contextlib import contextmanager
+from contextvars import ContextVar
+from datetime import datetime, timezone
+import http.client
+import ipaddress
 import json
+import math
 import os
 import re
+import socket
+import threading
+import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
-from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+from urllib.request import HTTPHandler, HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener
 
 from . import __version__
 
 DEFAULT_LCD_URL = "https://terra-classic-lcd.publicnode.com"
 MAX_QUERY_BYTES = 64 * 1024
 MAX_LCD_BYTES = 4 * 1024 * 1024
+MAX_CALL_SECONDS = 30
+CHAIN_STATUS_TTL_SECONDS = 10
+MAX_VALIDATOR_PAGES = 5
+EXPECTED_CHAIN_ID = "columbus-5"
+_deadline: ContextVar[float | None] = ContextVar("terra_lcd_deadline", default=None)
 TX_HASH_RE = re.compile(r"^[A-Fa-f0-9]{64}$")
 BECH32_ALPHABET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+DENOM_RE = re.compile(r"^[A-Za-z0-9/._:-]{1,128}$")
+IBC_DENOM_RE = re.compile(r"^ibc/[A-Fa-f0-9]{64}$")
+CHANNEL_RE = re.compile(r"^channel-[0-9]{1,12}$")
+AMOUNT_RE = re.compile(r"^[0-9]{1,78}(?:\.[0-9]{1,18})?$")
 PROPOSAL_STATUSES = {
     "all": "",
     "voting": "PROPOSAL_STATUS_VOTING_PERIOD",
@@ -37,9 +56,77 @@ class NoRedirect(HTTPRedirectHandler):
         raise TerraError("LCD redirects are not allowed")
 
 
-def configured_lcd_url() -> str:
-    value = os.environ.get("TERRA_CLASSIC_LCD_URL", DEFAULT_LCD_URL).rstrip("/")
+@contextmanager
+def lcd_deadline(seconds: int = MAX_CALL_SECONDS):
+    token = _deadline.set(time.monotonic() + seconds)
+    try:
+        yield
+    finally:
+        _deadline.reset(token)
+
+
+def _safe_connection(connection):
+    allow_private = os.environ.get("TERRA_CLASSIC_LCD_ALLOW_PRIVATE_IP") == "true"
+    try:
+        addresses = socket.getaddrinfo(connection.host, connection.port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise TerraError("LCD DNS resolution failed") from exc
+    for family, socktype, protocol, _, address in addresses:
+        ip = ipaddress.ip_address(address[0])
+        local_host = ip.is_loopback and connection.host in {"localhost", "127.0.0.1", "::1"}
+        private_lcd = allow_private and ip.is_private and not (
+            ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified
+        )
+        if not (ip.is_global or local_host or private_lcd):
+            raise TerraError("LCD resolved to a disallowed IP address")
+    if not addresses:
+        raise TerraError("LCD DNS resolution failed")
+    last_error = None
+    for family, socktype, protocol, _, address in addresses:
+        sock = socket.socket(family, socktype, protocol)
+        try:
+            sock.settimeout(connection.timeout)
+            sock.connect(address)
+            connection.sock = sock
+            return
+        except OSError as exc:
+            last_error = exc
+            sock.close()
+    raise TerraError("LCD connection unavailable") from last_error
+
+
+class SafeHTTPConnection(http.client.HTTPConnection):
+    def connect(self):
+        _safe_connection(self)
+
+
+class SafeHTTPSConnection(http.client.HTTPSConnection):
+    def connect(self):
+        _safe_connection(self)
+        try:
+            self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
+        except Exception:
+            self.sock.close()
+            raise
+
+
+class SafeHTTPHandler(HTTPHandler):
+    def http_open(self, request):
+        return self.do_open(SafeHTTPConnection, request)
+
+
+class SafeHTTPSHandler(HTTPSHandler):
+    def https_open(self, request):
+        return self.do_open(SafeHTTPSConnection, request, context=self._context)
+
+
+def _validated_lcd_url(value: str, allowed_hosts: str) -> str:
+    value = value.rstrip("/")
     parsed = urlsplit(value)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise TerraError("Invalid LCD URL in server configuration") from exc
     if (
         parsed.scheme not in {"https", "http"}
         or not parsed.hostname
@@ -48,12 +135,33 @@ def configured_lcd_url() -> str:
         or parsed.query
         or parsed.fragment
         or parsed.path not in {"", "/"}
+        or (port is not None and not 1 <= port <= 65535)
     ):
         raise TerraError("Invalid LCD URL in server configuration")
     if parsed.scheme == "http" and os.environ.get("TERRA_CLASSIC_ALLOW_HTTP_LCD") != "true":
         if parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
             raise TerraError("HTTP LCD requires TERRA_CLASSIC_ALLOW_HTTP_LCD=true")
+    allowed = {host.strip().lower() for host in allowed_hosts.split(",") if host.strip()}
+    if parsed.hostname.lower() not in allowed:
+        raise TerraError("LCD host is not in the operator allowlist")
     return value
+
+
+def configured_lcd_url() -> str:
+    return _validated_lcd_url(
+        os.environ.get("TERRA_CLASSIC_LCD_URL", DEFAULT_LCD_URL),
+        os.environ.get("TERRA_CLASSIC_LCD_ALLOWED_HOSTS", "terra-classic-lcd.publicnode.com"),
+    )
+
+
+def configured_secondary_lcd_url() -> str | None:
+    value = os.environ.get("TERRA_CLASSIC_SECONDARY_LCD_URL")
+    if not value:
+        return None
+    validated = _validated_lcd_url(value, os.environ.get("TERRA_CLASSIC_SECONDARY_LCD_ALLOWED_HOSTS", ""))
+    if urlsplit(validated).hostname == urlsplit(configured_lcd_url()).hostname:
+        raise TerraError("Secondary LCD must use a different configured host")
+    return validated
 
 
 def _bech32_polymod(values: list[int]) -> int:
@@ -101,20 +209,58 @@ def require_page_key(value: str) -> str:
     return value
 
 
-def next_page_key(payload: dict) -> str | None:
+def next_page_key(payload: dict, previous: str = "") -> str | None:
     pagination = payload.get("pagination")
     if not isinstance(pagination, dict):
         raise TerraError("Invalid LCD pagination")
     key = pagination.get("next_key")
     if key is None or key == "":
         return None
-    return require_page_key(key)
+    key = require_page_key(key)
+    if key == previous:
+        raise TerraError("LCD pagination cursor did not advance")
+    return key
 
 
 def require_page_limit(value: int) -> int:
     if type(value) is not int or not 1 <= value <= 20:
         raise TerraError("limit must be an integer between 1 and 20")
     return value
+
+
+def require_denom(value: str) -> str:
+    if not isinstance(value, str) or not DENOM_RE.fullmatch(value):
+        raise TerraError("Invalid denomination")
+    return value
+
+
+def require_ibc_denom(value: str) -> str:
+    if not isinstance(value, str) or not IBC_DENOM_RE.fullmatch(value):
+        raise TerraError("IBC denomination must be ibc/ followed by 64 hexadecimal characters")
+    return "ibc/" + value[4:].upper()
+
+
+def require_channel(value: str) -> str:
+    if not isinstance(value, str) or not CHANNEL_RE.fullmatch(value):
+        raise TerraError("Invalid IBC channel ID")
+    return value
+
+
+def require_sequence(value: int) -> int:
+    if type(value) is not int or not 1 <= value <= 9223372036854775807:
+        raise TerraError("IBC packet sequence must be a positive integer")
+    return value
+
+
+def require_allowlisted_cw20_contract(value: str) -> str:
+    contract = require_address(value)
+    configured = os.environ.get("TERRA_CLASSIC_CW20_CONTRACTS", "")
+    contracts = [part.strip() for part in configured.split(",") if part.strip()]
+    if len(contracts) > 20 or any(require_address(item) != item for item in contracts):
+        raise TerraError("Invalid CW20 contract allowlist in server configuration")
+    if contract not in contracts:
+        raise TerraError("CW20 contract is not allowlisted by the server")
+    return contract
 
 
 def _coins(value: object) -> list[dict[str, str]]:
@@ -125,13 +271,50 @@ def _coins(value: object) -> list[dict[str, str]]:
         if (
             not isinstance(item, dict)
             or not isinstance(item.get("denom"), str)
-            or not item["denom"]
+            or not DENOM_RE.fullmatch(item["denom"])
             or not isinstance(item.get("amount"), str)
-            or not item["amount"]
+            or not AMOUNT_RE.fullmatch(item["amount"])
         ):
             raise TerraError("Invalid LCD coin list")
         coins.append({"denom": item["denom"], "amount": item["amount"]})
     return coins
+
+
+def validate_json_tree(value: object, *, max_depth: int = 12, max_nodes: int = 512, max_string: int = 4096) -> None:
+    """Reject deeply nested or oversized untrusted JSON without changing its meaning."""
+    stack = [(value, 0)]
+    nodes = 0
+    while stack:
+        item, depth = stack.pop()
+        nodes += 1
+        if nodes > max_nodes or depth > max_depth:
+            raise TerraError("JSON structure is too complex")
+        if isinstance(item, dict):
+            if len(item) > 100:
+                raise TerraError("JSON object has too many fields")
+            for key, child in item.items():
+                if not isinstance(key, str) or not 1 <= len(key) <= 128 or any(ord(char) < 32 for char in key):
+                    raise TerraError("Invalid JSON field name")
+                stack.append((child, depth + 1))
+        elif isinstance(item, list):
+            if len(item) > 200:
+                raise TerraError("JSON array is too large")
+            stack.extend((child, depth + 1) for child in item)
+        elif isinstance(item, str):
+            if len(item) > max_string:
+                raise TerraError("JSON text is too large")
+        elif item is None or isinstance(item, (bool, int)):
+            if type(item) is int and item.bit_length() > 260:
+                raise TerraError("JSON integer is too large")
+        elif isinstance(item, float):
+            if not math.isfinite(item):
+                raise TerraError("Invalid JSON number")
+        else:
+            raise TerraError("Invalid JSON value")
+
+
+def _reject_json_constant(_value: str):
+    raise TerraError("Invalid JSON number")
 
 
 def require_tx_hash(value: str) -> str:
@@ -143,6 +326,7 @@ def require_tx_hash(value: str) -> str:
 def require_query(value: dict) -> dict:
     if not isinstance(value, dict) or not value:
         raise TerraError("Contract query must be a non-empty JSON object")
+    validate_json_tree(value, max_nodes=256)
     try:
         encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
     except (TypeError, ValueError, OverflowError) as exc:
@@ -153,61 +337,196 @@ def require_query(value: dict) -> dict:
 
 
 class LcdClient:
-    def __init__(self, base_url: str | None = None, opener=None):
+    def __init__(self, base_url: str | None = None, opener=None, source_label: str | None = None):
         self.base_url = (base_url or configured_lcd_url()).rstrip("/")
-        self.opener = opener or build_opener(ProxyHandler({}), NoRedirect())
+        self.source_label = source_label or os.environ.get("TERRA_CLASSIC_LCD_SOURCE_LABEL", "operator-configured LCD")
+        self.opener = opener or build_opener(ProxyHandler({}), NoRedirect(), SafeHTTPHandler(), SafeHTTPSHandler())
+        self._status_lock = threading.Lock()
+        self._checked_at = 0.0
+        self._cached_status = None
+        self._validators_lock = threading.Lock()
+        self._validators_checked_at = 0.0
+        self._cached_validators = None
 
-    def request(self, path: str, *, max_bytes: int = MAX_LCD_BYTES):
-        if not path.startswith("/") or ".." in path or "#" in path:
-            raise TerraError("Invalid LCD path")
+    def source_metadata(self) -> dict:
+        if self._cached_status is None:
+            raise TerraError("LCD chain status has not been verified")
+        return {
+            "lcd_id": self.source_label,
+            "chain_id": self._cached_status["chain_id"],
+            "verified_height": self._cached_status["height"],
+            "verified_block_time": self._cached_status["time"],
+        }
+
+    def _raw_request(self, path: str, *, max_bytes: int = MAX_LCD_BYTES, allow_not_found: bool = False):
+        deadline = _deadline.get()
+        remaining = deadline - time.monotonic() if deadline is not None else 15
+        if remaining <= 0:
+            raise TerraError("LCD call deadline exceeded")
+        timeout = min(15, remaining)
         request = Request(
             self.base_url + path,
             method="GET",
             headers={"Accept": "application/json", "User-Agent": f"terra-classic-mcp/{__version__}"},
         )
         try:
-            with self.opener.open(request, timeout=15) as response:
-                raw = response.read(max_bytes + 1)
-        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            with self.opener.open(request, timeout=timeout) as response:
+                raw = bytearray()
+                reader = getattr(response, "read1", response.read)
+                while len(raw) <= max_bytes:
+                    if deadline is not None and time.monotonic() > deadline:
+                        raise TerraError("LCD call deadline exceeded")
+                    chunk = reader(min(65536, max_bytes + 1 - len(raw)))
+                    if not chunk:
+                        break
+                    raw.extend(chunk)
+        except HTTPError as exc:
+            if allow_not_found and exc.code == 404:
+                return None
+            raise TerraError("LCD request unavailable") from exc
+        except (URLError, TimeoutError, OSError) as exc:
             raise TerraError("LCD request unavailable") from exc
         if len(raw) > max_bytes:
             raise TerraError("LCD response is too large")
+        if deadline is not None and time.monotonic() > deadline:
+            raise TerraError("LCD call deadline exceeded")
         try:
-            return json.loads(raw)
+            payload = json.loads(raw, parse_constant=_reject_json_constant)
         except (ValueError, UnicodeError) as exc:
             raise TerraError("Invalid LCD JSON response") from exc
+        validate_json_tree(payload, max_depth=32, max_nodes=30000, max_string=MAX_LCD_BYTES)
+        return payload
+
+    def _check_status(self, *, refresh: bool = False) -> dict:
+        with self._status_lock:
+            if not refresh and self._cached_status is not None and time.monotonic() - self._checked_at < CHAIN_STATUS_TTL_SECONDS:
+                return self._cached_status
+            payload = self._raw_request("/cosmos/base/tendermint/v1beta1/blocks/latest")
+            try:
+                header = payload["block"]["header"]
+                result = {
+                    "chain_id": header["chain_id"], "height": header["height"],
+                    "time": header["time"], "block_id": payload["block_id"]["hash"],
+                }
+            except (KeyError, TypeError) as exc:
+                raise TerraError("Invalid latest block response") from exc
+            if not all(isinstance(value, str) and value for value in result.values()):
+                raise TerraError("Invalid latest block response")
+            expected = os.environ.get("TERRA_CLASSIC_EXPECTED_CHAIN_ID", EXPECTED_CHAIN_ID)
+            if result["chain_id"] != expected or not re.fullmatch(r"[1-9][0-9]{0,19}", result["height"]):
+                raise TerraError("LCD chain ID or block height does not match the configured network")
+            try:
+                block_time = datetime.fromisoformat(result["time"].replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise TerraError("Invalid latest block time") from exc
+            if block_time.tzinfo is None:
+                raise TerraError("Invalid latest block time")
+            try:
+                max_age = int(os.environ.get("TERRA_CLASSIC_MAX_BLOCK_AGE_SECONDS", "120"))
+            except ValueError as exc:
+                raise TerraError("Invalid maximum block age in server configuration") from exc
+            age = (datetime.now(timezone.utc) - block_time).total_seconds()
+            if max_age < 1 or age > max_age or age < -60:
+                raise TerraError("LCD latest block is stale or in the future")
+            self._cached_status = result
+            self._checked_at = time.monotonic()
+            return result
+
+    def request(self, path: str, *, max_bytes: int = MAX_LCD_BYTES, allow_not_found: bool = False):
+        if not path.startswith("/") or ".." in path or "#" in path:
+            raise TerraError("Invalid LCD path")
+        self._check_status()
+        return self._raw_request(path, max_bytes=max_bytes, allow_not_found=allow_not_found)
 
     def chain_status(self) -> dict:
-        payload = self.request("/cosmos/base/tendermint/v1beta1/blocks/latest")
-        try:
-            header = payload["block"]["header"]
-            result = {
-                "chain_id": header["chain_id"],
-                "height": header["height"],
-                "time": header["time"],
-                "block_id": payload["block_id"]["hash"],
-            }
-        except (KeyError, TypeError) as exc:
-            raise TerraError("Invalid latest block response") from exc
-        if not all(isinstance(value, str) and value for value in result.values()):
-            raise TerraError("Invalid latest block response")
-        return result
+        return self._check_status(refresh=True)
 
-    def balance(self, address: str) -> dict:
-        payload = self.request(
-            "/cosmos/bank/v1beta1/balances/" + quote(address, safe="") + "?pagination.limit=100"
-        )
-        if not isinstance(payload, dict) or not isinstance(payload.get("balances"), list):
+    def balance(self, address: str, limit: int = 20, page_key: str = "") -> dict:
+        address = require_address(address)
+        limit = require_page_limit(limit)
+        page_key = require_page_key(page_key)
+        path = "/cosmos/bank/v1beta1/balances/" + quote(address, safe="") + f"?pagination.limit={limit}"
+        if page_key:
+            path += "&pagination.key=" + quote(page_key, safe="")
+        payload = self.request(path)
+        if not isinstance(payload, dict) or not isinstance(payload.get("balances"), list) or len(payload["balances"]) > limit:
             raise TerraError("Invalid balance response")
-        balances = []
-        for coin in payload["balances"]:
-            if not isinstance(coin, dict) or not isinstance(coin.get("denom"), str) or not isinstance(coin.get("amount"), str):
-                raise TerraError("Invalid balance response")
-            balances.append({"denom": coin["denom"], "amount": coin["amount"]})
-        pagination = payload.get("pagination") or {}
-        if not isinstance(pagination, dict):
-            raise TerraError("Invalid balance pagination")
-        return {"address": address, "balances": balances, "has_more": bool(pagination.get("next_key"))}
+        balances = _coins(payload["balances"])
+        key = next_page_key(payload, page_key)
+        return {"address": address, "balances": balances, "next_key": key, "has_more": key is not None}
+
+    def denom_metadata(self, denom: str) -> dict:
+        denom = require_denom(denom)
+        payload = self.request("/cosmos/bank/v1beta1/denoms_metadata/" + quote(denom, safe=""), max_bytes=32 * 1024)
+        metadata = payload.get("metadata") if isinstance(payload, dict) else None
+        if not isinstance(metadata, dict) or metadata.get("base") != denom:
+            raise TerraError("Invalid bank denomination metadata")
+        display, name, symbol = (metadata.get(key) for key in ("display", "name", "symbol"))
+        if any(not isinstance(value, str) or not 1 <= len(value) <= 64 or any(ord(char) < 32 for char in value) for value in (display, name, symbol)):
+            raise TerraError("Invalid bank denomination metadata")
+        units = metadata.get("denom_units")
+        if not isinstance(units, list) or not 1 <= len(units) <= 20:
+            raise TerraError("Invalid bank denomination units")
+        compact = []
+        for unit in units:
+            if not isinstance(unit, dict) or not isinstance(unit.get("denom"), str) or not DENOM_RE.fullmatch(unit["denom"]):
+                raise TerraError("Invalid bank denomination units")
+            exponent = unit.get("exponent")
+            if type(exponent) is int:
+                pass
+            elif isinstance(exponent, str) and exponent.isascii() and exponent.isdigit():
+                exponent = int(exponent)
+            else:
+                raise TerraError("Invalid bank denomination exponent")
+            if not 0 <= exponent <= 36:
+                raise TerraError("Invalid bank denomination exponent")
+            compact.append({"denom": unit["denom"], "exponent": exponent})
+        if not any(unit["denom"] == denom and unit["exponent"] == 0 for unit in compact):
+            raise TerraError("Bank metadata is missing the base denomination")
+        display_units = [unit for unit in compact if unit["denom"] == display]
+        if len(display_units) != 1:
+            raise TerraError("Bank metadata is missing the display denomination")
+        return {"denom": denom, "display": display, "name": name, "symbol": symbol,
+                "display_decimals": display_units[0]["exponent"], "denom_units": compact}
+
+    def ibc_denom_trace(self, denom: str) -> dict:
+        denom = require_ibc_denom(denom)
+        payload = self.request("/ibc/apps/transfer/v1/denoms/" + denom[4:], max_bytes=32 * 1024)
+        record = payload.get("denom") if isinstance(payload, dict) else None
+        if not isinstance(record, dict):
+            raise TerraError("Invalid IBC denomination trace")
+        base, trace = record.get("base"), record.get("trace")
+        if not isinstance(base, str) or not DENOM_RE.fullmatch(base) or not isinstance(trace, list) or not 1 <= len(trace) <= 8:
+            raise TerraError("Invalid IBC denomination trace")
+        hops = []
+        for hop in trace:
+            if not isinstance(hop, dict) or hop.get("port_id") != "transfer":
+                raise TerraError("Invalid IBC denomination trace")
+            hops.append({"port_id": "transfer", "channel_id": require_channel(hop.get("channel_id"))})
+        full_trace = "/".join([part for hop in hops for part in (hop["port_id"], hop["channel_id"])] + [base])
+        if hashlib.sha256(full_trace.encode()).hexdigest().upper() != denom[4:]:
+            raise TerraError("IBC denomination trace hash mismatch")
+        return {"denom": denom, "base_denom": base, "trace": hops, "full_trace": full_trace, "hash_verified": True}
+
+    def balance_of_denom(self, address: str, denom: str) -> str:
+        address, denom = require_account_address(address), require_denom(denom)
+        cursor = ""
+        seen_cursors: set[str] = set()
+        amount = None
+        for _ in range(5):
+            page = self.balance(address, limit=20, page_key=cursor)
+            for coin in page["balances"]:
+                if coin["denom"] == denom:
+                    if amount is not None:
+                        raise TerraError("Duplicate denomination in LCD balances")
+                    amount = coin["amount"]
+            cursor = page["next_key"] or ""
+            if not cursor:
+                return amount or "0"
+            if cursor in seen_cursors:
+                raise TerraError("Balance pagination cycle")
+            seen_cursors.add(cursor)
+        raise TerraError("Balance comparison requires more than five LCD pages")
 
     def transaction(self, tx_hash: str) -> dict:
         payload = self.request("/cosmos/tx/v1beta1/txs/" + quote(tx_hash, safe=""))
@@ -230,6 +549,86 @@ class LcdClient:
             raise TerraError("Invalid transaction response") from exc
         return result
 
+    def ibc_transfer_transaction(self, tx_hash: str) -> dict:
+        tx_hash = require_tx_hash(tx_hash)
+        payload = self.request("/cosmos/tx/v1beta1/txs/" + tx_hash, max_bytes=512 * 1024)
+        response = payload.get("tx_response") if isinstance(payload, dict) else None
+        if (not isinstance(response, dict) or not isinstance(response.get("txhash"), str)
+                or require_tx_hash(response["txhash"]) != tx_hash or type(response.get("code")) is not int):
+            raise TerraError("Invalid IBC transaction response")
+        events = response.get("events")
+        if not isinstance(events, list) or len(events) > 200:
+            raise TerraError("Invalid IBC transaction events")
+        packets = []
+        for event in events:
+            if not isinstance(event, dict):
+                raise TerraError("Invalid IBC transaction event")
+            if event.get("type") != "send_packet":
+                continue
+            attributes = event.get("attributes")
+            if not isinstance(attributes, list) or len(attributes) > 30:
+                raise TerraError("Invalid IBC packet event")
+            values = {}
+            for attribute in attributes:
+                if not isinstance(attribute, dict) or not isinstance(attribute.get("key"), str) or not isinstance(attribute.get("value"), str):
+                    raise TerraError("Invalid IBC packet event")
+                key, value = attribute["key"], attribute["value"]
+                if len(key) > 64 or len(value) > 256 or key in values:
+                    raise TerraError("Invalid IBC packet event")
+                values[key] = value
+            try:
+                raw_sequence = values["packet_sequence"]
+                if not re.fullmatch(r"[1-9][0-9]{0,18}", raw_sequence):
+                    raise ValueError("Invalid packet sequence")
+                sequence = require_sequence(int(raw_sequence))
+                source_channel = require_channel(values["packet_src_channel"])
+                destination_channel = require_channel(values["packet_dst_channel"])
+                if values["packet_src_port"] != "transfer" or values["packet_dst_port"] != "transfer":
+                    raise TerraError("Not an ICS-20 transfer packet")
+            except (KeyError, ValueError) as exc:
+                raise TerraError("Invalid IBC packet event") from exc
+            packets.append({"sequence": sequence, "source_channel": source_channel, "destination_channel": destination_channel})
+            if len(packets) > 10:
+                raise TerraError("Too many IBC transfer packets in transaction")
+        return {"tx_hash": tx_hash, "tx_code": response["code"], "packets": packets}
+
+    def ibc_packet_observation(self, channel_id: str, sequence: int, local_role: str) -> dict:
+        channel_id, sequence = require_channel(channel_id), require_sequence(sequence)
+        if local_role not in {"source", "destination"}:
+            raise TerraError("Invalid IBC local role")
+        base = f"/ibc/core/channel/v1/channels/{channel_id}/ports/transfer"
+        if local_role == "source":
+            payload = self.request(f"{base}/packet_commitments/{sequence}", max_bytes=16 * 1024, allow_not_found=True)
+            if payload is None:
+                observation = "not_found_or_unsupported"
+            elif isinstance(payload, dict) and isinstance(payload.get("commitment"), str) and 1 <= len(payload["commitment"]) <= 512:
+                try:
+                    base64.b64decode(payload["commitment"], validate=True)
+                except (ValueError, binascii.Error) as exc:
+                    raise TerraError("Invalid IBC packet commitment response") from exc
+                observation = "commitment_present"
+            else:
+                raise TerraError("Invalid IBC packet commitment response")
+        else:
+            receipt = self.request(f"{base}/packet_receipts/{sequence}", max_bytes=16 * 1024, allow_not_found=True)
+            acknowledgement = self.request(f"{base}/packet_acks/{sequence}", max_bytes=16 * 1024, allow_not_found=True)
+            if receipt is not None and (not isinstance(receipt, dict) or type(receipt.get("received")) is not bool):
+                raise TerraError("Invalid IBC packet receipt response")
+            if acknowledgement is not None and (not isinstance(acknowledgement, dict) or not isinstance(acknowledgement.get("acknowledgement"), str)
+                                                or not 1 <= len(acknowledgement["acknowledgement"]) <= 4096):
+                raise TerraError("Invalid IBC packet acknowledgement response")
+            if acknowledgement is not None:
+                try:
+                    base64.b64decode(acknowledgement["acknowledgement"], validate=True)
+                except (ValueError, binascii.Error) as exc:
+                    raise TerraError("Invalid IBC packet acknowledgement response") from exc
+            observation = "acknowledgement_present" if acknowledgement is not None else "receipt_present" if receipt and receipt["received"] else "not_found_or_unsupported"
+        return {"channel_id": channel_id, "sequence": sequence, "local_role": local_role,
+                "observation": observation, "transfer_outcome_confirmed": False,
+                "commitment_observed": payload is not None if local_role == "source" else None,
+                "receipt_observed": receipt["received"] if local_role == "destination" and receipt is not None else None,
+                "acknowledgement_observed": acknowledgement is not None if local_role == "destination" else None}
+
     def contract_query(self, contract: str, query_msg: dict) -> dict:
         raw = json.dumps(query_msg, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
         query_data = quote(base64.b64encode(raw).decode(), safe="")
@@ -239,23 +638,55 @@ class LcdClient:
         payload = self.request(path)
         if not isinstance(payload, dict) or "data" not in payload:
             raise TerraError("Invalid contract response")
+        validate_json_tree(payload["data"])
         return {"contract": contract, "data": payload["data"]}
 
+    def cw20_token_info(self, contract: str) -> dict:
+        contract = require_allowlisted_cw20_contract(contract)
+        data = self.contract_query(contract, {"token_info": {}})["data"]
+        if not isinstance(data, dict):
+            raise TerraError("Invalid CW20 token information")
+        name, symbol, decimals, supply = (data.get(key) for key in ("name", "symbol", "decimals", "total_supply"))
+        if (not isinstance(name, str) or not 1 <= len(name) <= 128 or any(ord(char) < 32 for char in name)
+                or not isinstance(symbol, str) or not 1 <= len(symbol) <= 32 or any(ord(char) < 32 for char in symbol)
+                or type(decimals) is not int or not 0 <= decimals <= 18
+                or not isinstance(supply, str) or not re.fullmatch(r"[0-9]{1,78}", supply)):
+            raise TerraError("Invalid CW20 token information")
+        return {"contract": contract, "name": name, "symbol": symbol, "decimals": decimals, "total_supply": supply}
+
+    def cw20_balance(self, contract: str, address: str) -> dict:
+        contract = require_allowlisted_cw20_contract(contract)
+        address = require_account_address(address)
+        data = self.contract_query(contract, {"balance": {"address": address}})["data"]
+        if not isinstance(data, dict) or not isinstance(data.get("balance"), str) or not re.fullmatch(r"[0-9]{1,78}", data["balance"]):
+            raise TerraError("Invalid CW20 balance response")
+        return {"contract": contract, "address": address, "balance": data["balance"]}
+
     def validators(self, limit: int = 10) -> dict:
+        self._check_status()
+        with self._validators_lock:
+            if self._cached_validators is None or time.monotonic() - self._validators_checked_at >= 10:
+                self._cached_validators = self._fetch_validators()
+                self._validators_checked_at = time.monotonic()
+            return {**self._cached_validators, "validators": self._cached_validators["validators"][:limit]}
+
+    def _fetch_validators(self) -> dict:
         all_validators: list[dict] = []
         next_key = None
-        for _ in range(20):
+        seen_keys: set[str] = set()
+        for _ in range(MAX_VALIDATOR_PAGES):
             path = "/cosmos/staking/v1beta1/validators?status=BOND_STATUS_BONDED&pagination.limit=100"
             if next_key:
                 path += "&pagination.key=" + quote(next_key, safe="")
             page = self.request(path)
-            if not isinstance(page, dict) or not isinstance(page.get("validators"), list):
+            if not isinstance(page, dict) or not isinstance(page.get("validators"), list) or len(page["validators"]) > 100:
                 raise TerraError("Invalid validator response")
             all_validators.extend(page["validators"])
-            pagination = page.get("pagination") or {}
-            if not isinstance(pagination, dict):
-                raise TerraError("Invalid validator pagination")
-            next_key = pagination.get("next_key")
+            next_key = next_page_key(page, next_key or "")
+            if next_key in seen_keys:
+                raise TerraError("Validator pagination cycle")
+            if next_key:
+                seen_keys.add(next_key)
             if not next_key:
                 break
         if next_key or not all_validators:
@@ -264,19 +695,23 @@ class LcdClient:
             ranked = sorted(all_validators, key=lambda item: int(item["tokens"]), reverse=True)
             total_tokens = sum(int(item["tokens"]) for item in ranked)
             validators = []
-            for rank, item in enumerate(ranked[:limit], 1):
+            for rank, item in enumerate(ranked[:20], 1):
                 tokens = int(item["tokens"])
                 description = item.get("description") or {}
                 rate = (item.get("commission") or {}).get("commission_rates") or {}
+                moniker = description.get("moniker") or item["operator_address"]
+                website = description.get("website") or ""
+                if not isinstance(moniker, str) or len(moniker) > 128 or not isinstance(website, str) or len(website) > 256:
+                    raise TerraError("Invalid validator description")
                 validators.append({
                     "rank": rank,
-                    "moniker": description.get("moniker") or item["operator_address"],
+                    "moniker": moniker,
                     "operator_address": item["operator_address"],
                     "tokens": str(tokens),
                     "voting_power_pct": round(tokens * 100 / total_tokens, 6) if total_tokens else 0.0,
                     "commission_rate_pct": round(float(rate.get("rate", 0)) * 100, 6),
                     "jailed": bool(item.get("jailed", False)),
-                    "website": description.get("website") or "",
+                    "website": website,
                 })
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise TerraError("Invalid validator response") from exc
@@ -305,7 +740,7 @@ class LcdClient:
             if not isinstance(validator, str) or not validator.startswith("terravaloper1"):
                 raise TerraError("Invalid delegation response")
             delegations.append({"validator_address": validator, "balance": balance})
-        return {"address": address, "delegations": delegations, "next_key": next_page_key(payload)}
+        return {"address": address, "delegations": delegations, "next_key": next_page_key(payload, page_key)}
 
     def unbonding_delegations(self, address: str, limit: int = 20, page_key: str = "") -> dict:
         address = require_account_address(address)
@@ -333,7 +768,7 @@ class LcdClient:
                     raise TerraError("Invalid unbonding response")
                 compact_entries.append({"balance": entry["balance"], "completion_time": entry["completion_time"]})
             unbonding.append({"validator_address": item["validator_address"], "entries": compact_entries})
-        return {"address": address, "unbonding": unbonding, "next_key": next_page_key(payload)}
+        return {"address": address, "unbonding": unbonding, "next_key": next_page_key(payload, page_key)}
 
     def staking_rewards(self, address: str) -> dict:
         address = require_account_address(address)
@@ -368,8 +803,10 @@ class LcdClient:
         for item in items:
             if not isinstance(item, dict) or any(not isinstance(item.get(key), str) for key in ("id", "title", "status", "voting_end_time")):
                 raise TerraError("Invalid governance proposals response")
+            if len(item["title"]) > 256:
+                raise TerraError("Governance proposal title is too large")
             proposals.append({key: item[key] for key in ("id", "title", "status", "voting_end_time")})
-        return {"status_filter": status, "proposals": proposals, "next_key": next_page_key(payload)}
+        return {"status_filter": status, "proposals": proposals, "next_key": next_page_key(payload, page_key)}
 
     def governance_proposal(self, proposal_id: int) -> dict:
         if type(proposal_id) is not int or not 1 <= proposal_id <= 9223372036854775807:
@@ -381,6 +818,8 @@ class LcdClient:
         fields = ("id", "title", "summary", "status", "submit_time", "voting_start_time", "voting_end_time")
         if any(not isinstance(item.get(key), str) for key in fields) or item["id"] != str(proposal_id):
             raise TerraError("Invalid governance proposal response")
+        if len(item["title"]) > 256:
+            raise TerraError("Governance proposal title is too large")
         tally_kind = "none"
         tally = None
         if item["status"] == "PROPOSAL_STATUS_VOTING_PERIOD":
@@ -410,3 +849,22 @@ class LcdClient:
             "tally_kind": tally_kind,
             "tally": tally,
         }
+
+
+def compare_chain_status(primary: LcdClient, secondary: LcdClient) -> dict:
+    first, second = primary.chain_status(), secondary.chain_status()
+    same_height = first["height"] == second["height"]
+    same_block = first["block_id"] == second["block_id"] if same_height else None
+    verdict = "agree_observed" if same_block else "divergent_observation" if same_block is False else "inconclusive_height_mismatch"
+    return {"primary_height": first["height"], "secondary_height": second["height"],
+            "same_block": same_block, "verdict": verdict, "secondary_source": secondary.source_metadata()}
+
+
+def compare_balance(primary: LcdClient, secondary: LcdClient, address: str, denom: str) -> dict:
+    address, denom = require_account_address(address), require_denom(denom)
+    first = primary.balance_of_denom(address, denom)
+    second = secondary.balance_of_denom(address, denom)
+    same_height = primary.source_metadata()["verified_height"] == secondary.source_metadata()["verified_height"]
+    verdict = "inconclusive_height_mismatch" if not same_height else "agree_observed" if first == second else "divergent_observation"
+    return {"address": address, "denom": denom, "primary_amount": first, "secondary_amount": second,
+            "verdict": verdict, "secondary_source": secondary.source_metadata()}

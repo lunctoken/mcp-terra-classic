@@ -1,0 +1,10 @@
+# Replace the hostname and configure DNS before using this file.
+# Keep the MCP container bound to host loopback as in compose.yaml.
+mcp.example.org {
+    handle /mcp {
+        reverse_proxy 127.0.0.1:8000
+    }
+    handle {
+        respond "Not found" 404
+    }
+}
