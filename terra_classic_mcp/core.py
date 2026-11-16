@@ -657,9 +657,26 @@ class LcdClient:
                 kind = message.get("@type")
                 if not isinstance(kind, str) or not re.fullmatch(r"/[A-Za-z0-9_.]{1,128}", kind):
                     raise TerraError("Invalid transaction message type")
-                detail = {"index": index, "type_url": kind, "kind": "other", "addresses": [], "amount": [], "proposal_id": None, "vote_option": None}
+                detail = {"index": index, "type_url": kind, "kind": "other", "addresses": [], "amount": [],
+                          "proposal_id": None, "vote_option": None, "input_count": None, "output_count": None,
+                          "outputs": [], "outputs_truncated": False}
                 if kind == "/cosmos.bank.v1beta1.MsgSend":
                     detail.update(kind="bank_send", addresses=[require_address(message["from_address"]), require_address(message["to_address"])], amount=_coins(message["amount"]))
+                elif kind == "/cosmos.bank.v1beta1.MsgMultiSend":
+                    inputs, outputs = message["inputs"], message["outputs"]
+                    if (not isinstance(inputs, list) or not isinstance(outputs, list)
+                            or not 1 <= len(inputs) <= 50 or not 1 <= len(outputs) <= 50):
+                        raise TerraError("Invalid transaction multisend")
+                    for flow in inputs + outputs:
+                        if not isinstance(flow, dict):
+                            raise TerraError("Invalid transaction multisend")
+                        require_address(flow["address"])
+                        coins = _coins(flow["coins"])
+                        if not 1 <= len(coins) <= 20 or any(not INTEGER_AMOUNT_RE.fullmatch(coin["amount"]) for coin in coins):
+                            raise TerraError("Invalid transaction multisend amount")
+                    detail.update(kind="bank_multisend", input_count=len(inputs), output_count=len(outputs),
+                                  outputs=[{"address": item["address"], "coins": _coins(item["coins"])} for item in outputs[:10]],
+                                  outputs_truncated=len(outputs) > 10)
                 elif kind in {"/cosmos.staking.v1beta1.MsgDelegate", "/cosmos.staking.v1beta1.MsgUndelegate"}:
                     validator = message["validator_address"]
                     if not isinstance(validator, str) or not re.fullmatch(r"terravaloper1[023456789acdefghjklmnpqrstuvwxyz]{38}", validator):
@@ -673,8 +690,13 @@ class LcdClient:
                 if len(detail["amount"]) > 20 or any(not INTEGER_AMOUNT_RE.fullmatch(coin["amount"]) for coin in detail["amount"]):
                     raise TerraError("Invalid transaction amount")
                 compact.append(detail)
+            raw_log = response.get("raw_log") if response["code"] != 0 else None
+            if raw_log is not None and not isinstance(raw_log, str):
+                raise TerraError("Invalid transaction failure log")
             return {"tx_hash": tx_hash, "height": response["height"], "code": response["code"], "timestamp": response["timestamp"],
-                    "gas_limit": gas_limit, "fee": fee_amount, "memo": memo[:256], "memo_truncated": len(memo) > 256, "messages": compact}
+                    "gas_limit": gas_limit, "fee": fee_amount, "memo": memo[:256], "memo_truncated": len(memo) > 256,
+                    "failure_log": raw_log[:256] if raw_log is not None else None,
+                    "failure_log_truncated": len(raw_log) > 256 if raw_log is not None else False, "messages": compact}
         except (KeyError, TypeError, IndexError) as exc:
             raise TerraError("Invalid transaction response") from exc
 
@@ -928,6 +950,57 @@ class LcdClient:
                 raise TerraError("Invalid staking rewards response")
             rewards.append({"validator_address": item["validator_address"], "reward": _coins(item.get("reward"))})
         return {"address": address, "rewards": rewards, "total": _coins(payload.get("total"))}
+
+    def account_overview(self, address: str, limit: int = 5) -> dict:
+        address, limit = require_account_address(address), require_page_limit(limit)
+        if limit > 10:
+            raise TerraError("Overview limit must be between 1 and 10")
+        balances = self.balance(address, limit)
+        delegations = self.delegations(address, limit)
+        unbonding = self.unbonding_delegations(address, limit)
+        rewards = self.staking_rewards(address)
+        grants = self.authz_grants_received(address, limit)
+        if len(rewards["total"]) > 30:
+            raise TerraError("Too many reward denominations for an overview")
+        return {
+            "address": address, "page_limit": limit,
+            "balances": balances["balances"], "balances_next_key": balances["next_key"],
+            "delegations": delegations["delegations"], "delegations_next_key": delegations["next_key"],
+            "unbonding_validators": [{"validator_address": item["validator_address"], "entry_count": len(item["entries"])}
+                                      for item in unbonding["unbonding"]],
+            "unbonding_next_key": unbonding["next_key"],
+            "rewards_total": rewards["total"], "reward_validator_count": len(rewards["rewards"]),
+            "authz_grants": grants["grants"], "authz_next_key": grants["next_key"],
+            "has_more": any(key is not None for key in (balances["next_key"], delegations["next_key"],
+                                                         unbonding["next_key"], grants["next_key"])),
+        }
+
+    def governance_parameters(self) -> dict:
+        payload = self.request("/cosmos/gov/v1/params/voting", max_bytes=32 * 1024)
+        params = payload.get("params") if isinstance(payload, dict) else None
+        if not isinstance(params, dict):
+            raise TerraError("Invalid governance parameters")
+        fractions = {}
+        for key in ("quorum", "threshold", "veto_threshold"):
+            value = params.get(key)
+            if not isinstance(value, str) or not re.fullmatch(r"[0-9]{1,2}(?:\.[0-9]{1,18})?", value):
+                raise TerraError("Invalid governance " + key)
+            try:
+                if not Decimal(0) <= Decimal(value) <= Decimal(1):
+                    raise TerraError("Invalid governance " + key)
+            except InvalidOperation as exc:
+                raise TerraError("Invalid governance " + key) from exc
+            fractions[key] = value
+        durations = {}
+        for key in ("voting_period", "max_deposit_period"):
+            value = params.get(key)
+            if not isinstance(value, str) or not re.fullmatch(r"[0-9]{1,12}(?:\.[0-9]{1,9})?s", value):
+                raise TerraError("Invalid governance " + key)
+            durations[key] = value
+        deposit = _coins(params.get("min_deposit"))
+        if len(deposit) > 20 or any(not INTEGER_AMOUNT_RE.fullmatch(coin["amount"]) for coin in deposit):
+            raise TerraError("Invalid governance minimum deposit")
+        return {**fractions, **durations, "min_deposit": deposit}
 
     def governance_proposals(self, status: str = "all", limit: int = 10, page_key: str = "") -> dict:
         if not isinstance(status, str) or status not in PROPOSAL_STATUSES:

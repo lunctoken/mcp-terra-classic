@@ -9,7 +9,7 @@ from urllib.error import HTTPError
 import pytest
 from mcp import Client
 
-from terra_classic_mcp.app import build_server
+from terra_classic_mcp.app import AccountOverview, GovernanceParameters, TransactionExplanation, build_server
 from terra_classic_mcp.core import LcdClient, SafeHTTPConnection, SafeHTTPSConnection, SafeHTTPSHandler, TerraError, compare_balance, compare_chain_status, configured_secondary_lcd_url, lcd_deadline, require_account_address, require_address, require_page_key, require_query
 
 ADDRESS = "terra18vd8fpwxzck93qlwghaj6arh4p7c5n896xzem5"
@@ -225,6 +225,26 @@ def test_transaction_explanation_extracts_known_fields_and_bounds_memo():
         LcdClient(base_url="https://lcd.example", opener=Opener([bad])).explain_transaction("a" * 64)
 
 
+def test_transaction_explanation_multisend_and_failed_log_are_bounded():
+    outputs = [{"address": ADDRESS, "coins": [{"denom": "uluna", "amount": "2"}]} for _ in range(11)]
+    payload = {"tx_response": {"txhash": "A" * 64, "height": "4", "code": 5,
+                               "timestamp": "2026-11-16T00:00:00Z", "raw_log": "failure " * 60},
+               "tx": {"body": {"messages": [{"@type": "/cosmos.bank.v1beta1.MsgMultiSend",
+                                                "inputs": [{"address": ADDRESS, "coins": [{"denom": "uluna", "amount": "22"}]}],
+                                                "outputs": outputs}]},
+                      "auth_info": {"fee": {"amount": [], "gas_limit": "1000"}}}}
+    result = LcdClient(base_url="https://lcd.example", opener=Opener([payload])).explain_transaction("a" * 64)
+    message = result["messages"][0]
+    assert message["kind"] == "bank_multisend"
+    assert message["input_count"] == 1 and message["output_count"] == 11
+    assert len(message["outputs"]) == 10 and message["outputs_truncated"] is True
+    assert len(result["failure_log"]) == 256 and result["failure_log_truncated"] is True
+    assert TransactionExplanation.model_validate(result).messages[0].outputs_truncated is True
+    malformed = {**payload, "tx": {**payload["tx"], "body": {"messages": [{**payload["tx"]["body"]["messages"][0], "outputs": [{"address": ADDRESS, "coins": [{"denom": "uluna", "amount": "-1"}]}]}]}}}
+    with pytest.raises(TerraError):
+        LcdClient(base_url="https://lcd.example", opener=Opener([malformed])).explain_transaction("a" * 64)
+
+
 def test_validator_rank_uses_all_bonded_tokens():
     first = {"operator_address": "val1", "tokens": "100", "description": {"moniker": "One"}, "commission": {"commission_rates": {"rate": "0.05"}}}
     second = {"operator_address": "val2", "tokens": "300", "description": {"moniker": "Two"}, "commission": {"commission_rates": {"rate": "0.1"}}}
@@ -276,6 +296,40 @@ def test_unbonding_and_rewards_are_compact_reads():
     assert all(request.get_method() == "GET" for request in opener.requests)
     assert "/cosmos/staking/v1beta1/delegators/" in opener.requests[0].full_url
     assert "/cosmos/distribution/v1beta1/delegators/" in opener.requests[1].full_url
+
+
+def test_account_overview_marks_incomplete_sections_and_keeps_rewards_total():
+    grant = {"granter": ADDRESS, "authorization": {"@type": "/cosmos.authz.v1beta1.GenericAuthorization", "msg": "/cosmos.bank.v1beta1.MsgSend"}, "expiration": "2027-01-01T00:00:00Z"}
+    opener = Opener([
+        {"balances": [{"denom": "uluna", "amount": "10"}], "pagination": {"next_key": "YQ=="}},
+        {"delegation_responses": [], "pagination": {"next_key": None}},
+        {"unbonding_responses": [{"validator_address": "terravaloper1test", "entries": [{"balance": "5", "completion_time": "2027-01-01T00:00:00Z"}]}], "pagination": {"next_key": None}},
+        {"rewards": [], "total": [{"denom": "uluna", "amount": "1.5"}]},
+        {"grants": [grant], "pagination": {"next_key": None}},
+    ])
+    result = LcdClient(base_url="https://lcd.example", opener=opener).account_overview(ADDRESS, limit=1)
+    assert result["balances_next_key"] == "YQ==" and result["has_more"] is True
+    assert result["unbonding_validators"] == [{"validator_address": "terravaloper1test", "entry_count": 1}]
+    assert result["rewards_total"][0]["amount"] == "1.5"
+    assert result["authz_grants"][0]["authorization_type"] == "/cosmos.authz.v1beta1.GenericAuthorization"
+    assert AccountOverview.model_validate(result).has_more is True
+    assert len(opener.requests) == 5
+    with pytest.raises(TerraError, match="Overview limit"):
+        LcdClient(base_url="https://lcd.example", opener=Opener([])).account_overview(ADDRESS, limit=11)
+
+
+def test_governance_parameters_read_live_values_and_reject_bad_thresholds():
+    params = {"quorum": "0.400000000000000000", "threshold": "0.500000000000000000",
+              "veto_threshold": "0.334000000000000000", "voting_period": "604800s",
+              "max_deposit_period": "1209600s", "min_deposit": [{"denom": "uluna", "amount": "5000000000000"}]}
+    opener = Opener([{"params": params}])
+    result = LcdClient(base_url="https://lcd.example", opener=opener).governance_parameters()
+    assert result["quorum"] == params["quorum"]
+    assert result["min_deposit"][0]["amount"] == "5000000000000"
+    assert GovernanceParameters.model_validate(result).threshold == params["threshold"]
+    assert opener.requests[0].full_url.endswith("/cosmos/gov/v1/params/voting")
+    with pytest.raises(TerraError, match="threshold"):
+        LcdClient(base_url="https://lcd.example", opener=Opener([{"params": {**params, "threshold": "1.1"}}])).governance_parameters()
 
 
 def test_governance_list_and_final_tally():

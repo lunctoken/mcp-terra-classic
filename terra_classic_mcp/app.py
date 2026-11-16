@@ -134,15 +134,25 @@ class AuthzGrantsReceived(Result):
     has_more: bool
 
 
+class MultisendOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    address: Annotated[str, Field(min_length=44, max_length=64)]
+    coins: Annotated[list[Coin], Field(min_length=1, max_length=20)]
+
+
 class TransactionMessage(BaseModel):
     model_config = ConfigDict(extra="forbid")
     index: Annotated[int, Field(ge=0, le=49)]
     type_url: Annotated[str, Field(pattern=r"^/[A-Za-z0-9_.]{1,128}$")]
-    kind: Literal["bank_send", "delegate", "undelegate", "vote", "other"]
+    kind: Literal["bank_send", "bank_multisend", "delegate", "undelegate", "vote", "other"]
     addresses: Annotated[list[str], Field(max_length=2)]
     amount: Annotated[list[Coin], Field(max_length=20)]
     proposal_id: Annotated[str, Field(pattern=r"^[1-9][0-9]{0,18}$")] | None
     vote_option: Annotated[str, Field(pattern=r"^VOTE_OPTION_[A-Z_]{1,32}$")] | None
+    input_count: Annotated[int, Field(ge=1, le=50)] | None
+    output_count: Annotated[int, Field(ge=1, le=50)] | None
+    outputs: Annotated[list[MultisendOutput], Field(max_length=10)]
+    outputs_truncated: bool
 
 
 class TransactionExplanation(Result):
@@ -154,6 +164,8 @@ class TransactionExplanation(Result):
     fee: Annotated[list[Coin], Field(max_length=20)]
     memo: Annotated[str, Field(max_length=256)]
     memo_truncated: bool
+    failure_log: Annotated[str, Field(max_length=256)] | None
+    failure_log_truncated: bool
     messages: Annotated[list[TransactionMessage], Field(max_length=50)]
 
 
@@ -281,6 +293,37 @@ class StakingRewards(Result):
     total: list[Coin]
 
 
+class UnbondingOverview(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    validator_address: Annotated[str, Field(min_length=13, max_length=80)]
+    entry_count: Annotated[int, Field(ge=0, le=100)]
+
+
+class AccountOverview(Result):
+    address: Annotated[str, Field(min_length=44, max_length=44)]
+    page_limit: Annotated[int, Field(ge=1, le=10)]
+    balances: Annotated[list[Coin], Field(max_length=10)]
+    balances_next_key: Annotated[str, Field(max_length=512)] | None
+    delegations: Annotated[list[Delegation], Field(max_length=10)]
+    delegations_next_key: Annotated[str, Field(max_length=512)] | None
+    unbonding_validators: Annotated[list[UnbondingOverview], Field(max_length=10)]
+    unbonding_next_key: Annotated[str, Field(max_length=512)] | None
+    rewards_total: Annotated[list[Coin], Field(max_length=30)]
+    reward_validator_count: Annotated[int, Field(ge=0, le=200)]
+    authz_grants: Annotated[list[AuthzGrant], Field(max_length=10)]
+    authz_next_key: Annotated[str, Field(max_length=512)] | None
+    has_more: bool
+
+
+class GovernanceParameters(Result):
+    quorum: Annotated[str, Field(pattern=r"^[0-9]{1,2}(?:\.[0-9]{1,18})?$")]
+    threshold: Annotated[str, Field(pattern=r"^[0-9]{1,2}(?:\.[0-9]{1,18})?$")]
+    veto_threshold: Annotated[str, Field(pattern=r"^[0-9]{1,2}(?:\.[0-9]{1,18})?$")]
+    voting_period: Annotated[str, Field(pattern=r"^[0-9]{1,12}(?:\.[0-9]{1,9})?s$")]
+    max_deposit_period: Annotated[str, Field(pattern=r"^[0-9]{1,12}(?:\.[0-9]{1,9})?s$")]
+    min_deposit: Annotated[list[Coin], Field(max_length=20)]
+
+
 class GovernanceProposalSummary(Result):
     id: str
     title: Annotated[str, Field(max_length=256)]
@@ -329,6 +372,7 @@ ALLOWED_ARGUMENTS = {
     "terra_get_tax_parameters": frozenset(),
     "terra_get_burn_snapshot": frozenset(),
     "terra_get_authz_grants_received": frozenset({"address", "limit", "page_key"}),
+    "terra_get_account_overview": frozenset({"address", "limit"}),
     "terra_get_denom_metadata": frozenset({"denom"}),
     "terra_get_ibc_denom_trace": frozenset({"denom"}),
     "terra_get_delegations": frozenset({"address", "limit", "page_key"}),
@@ -336,6 +380,7 @@ ALLOWED_ARGUMENTS = {
     "terra_get_staking_rewards": frozenset({"address"}),
     "terra_get_governance_proposals": frozenset({"status", "limit", "page_key"}),
     "terra_get_governance_proposal": frozenset({"proposal_id"}),
+    "terra_get_governance_parameters": frozenset(),
     "terra_get_transaction": frozenset({"tx_hash"}),
     "terra_explain_transaction": frozenset({"tx_hash"}),
     "terra_get_ibc_transfer_transaction": frozenset({"tx_hash"}),
@@ -468,6 +513,17 @@ def build_server(client: LcdClient | None = None, secondary_client: LcdClient | 
         return read(lambda: lcd.authz_grants_received(require_account_address(address), require_page_limit(limit), require_page_key(page_key)), AuthzGrantsReceived)
 
     @server.tool(
+        title="Terra Classic account overview",
+        description="Read bounded first pages of native balances, delegations, unbonding validators and received authz grants, plus total staking rewards. Follow each section's next_key with its dedicated tool; observations can span blocks.",
+        annotations=READ_ONLY,
+    )
+    def terra_get_account_overview(
+        address: Annotated[str, Field(min_length=44, max_length=44, description="Public terra1 account address")],
+        limit: Annotated[int, Field(strict=True, ge=1, le=10, description="Entries in each paginated section (1–10)")] = 5,
+    ) -> AccountOverview:
+        return read(lambda: lcd.account_overview(require_account_address(address), limit), AccountOverview)
+
+    @server.tool(
         title="Terra Classic denomination metadata",
         description="Read on-chain bank metadata and display decimals for one native denomination. Do not infer metadata when the LCD has none.",
         annotations=READ_ONLY,
@@ -544,6 +600,14 @@ def build_server(client: LcdClient | None = None, secondary_client: LcdClient | 
         return read(lambda: lcd.governance_proposal(proposal_id), GovernanceProposal)
 
     @server.tool(
+        title="Terra Classic governance parameters",
+        description="Read current on-chain quorum, approval and veto thresholds, voting and deposit periods, and minimum deposit. Values are fractions and base-unit coins, not fixed defaults.",
+        annotations=READ_ONLY,
+    )
+    def terra_get_governance_parameters() -> GovernanceParameters:
+        return read(lcd.governance_parameters, GovernanceParameters)
+
+    @server.tool(
         title="Terra Classic transaction",
         description="Read a transaction summary by its 64-character hexadecimal hash. No transaction is broadcast.",
         annotations=READ_ONLY,
@@ -553,7 +617,7 @@ def build_server(client: LcdClient | None = None, secondary_client: LcdClient | 
     ) -> Transaction:
         return read(lambda: lcd.transaction(require_tx_hash(tx_hash)), Transaction)
 
-    @server.tool(title="Terra Classic transaction explanation", description="Read a bounded structured explanation of an included transaction, including fee, memo and recognized message fields. Unknown messages are identified only by type; no transaction is constructed.", annotations=READ_ONLY)
+    @server.tool(title="Terra Classic transaction explanation", description="Read a bounded structured explanation of an included transaction, including fee, memo, recognized messages and a capped failure log. Multisend outputs may be truncated; no transaction is constructed.", annotations=READ_ONLY)
     def terra_explain_transaction(
         tx_hash: Annotated[str, Field(pattern=r"^[A-Fa-f0-9]{64}$", description="Transaction hash")],
     ) -> TransactionExplanation:

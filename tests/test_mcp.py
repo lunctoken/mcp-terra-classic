@@ -15,10 +15,10 @@ ADDRESS = "terra18vd8fpwxzck93qlwghaj6arh4p7c5n896xzem5"
 ROOT = Path(__file__).resolve().parents[1]
 NAMES = [
     "terra_get_chain_status", "terra_get_validators", "terra_get_validator_page", "terra_get_balance",
-    "terra_get_tax_parameters", "terra_get_burn_snapshot", "terra_get_authz_grants_received",
+    "terra_get_tax_parameters", "terra_get_burn_snapshot", "terra_get_authz_grants_received", "terra_get_account_overview",
     "terra_get_denom_metadata", "terra_get_ibc_denom_trace",
     "terra_get_delegations", "terra_get_unbonding_delegations", "terra_get_staking_rewards",
-    "terra_get_governance_proposals", "terra_get_governance_proposal",
+    "terra_get_governance_proposals", "terra_get_governance_proposal", "terra_get_governance_parameters",
     "terra_get_transaction", "terra_explain_transaction", "terra_get_ibc_transfer_transaction", "terra_get_ibc_packet_observation",
     "terra_query_contract", "terra_get_cw20_token_info", "terra_get_cw20_balance",
     "terra_compare_chain_status", "terra_compare_balance",
@@ -54,6 +54,11 @@ class FakeClient:
     def authz_grants_received(self, address, limit=20, page_key=""):
         return {"grantee": address, "grants": [], "next_key": None, "has_more": False}
 
+    def account_overview(self, address, limit=5):
+        return {"address": address, "page_limit": limit, "balances": [], "balances_next_key": None,
+                "delegations": [], "delegations_next_key": None, "unbonding_validators": [], "unbonding_next_key": None,
+                "rewards_total": [], "reward_validator_count": 0, "authz_grants": [], "authz_next_key": None, "has_more": False}
+
     def balance(self, address, limit=20, page_key=""):
         return {"address": address, "balances": [], "next_key": None, "has_more": False}
 
@@ -80,12 +85,16 @@ class FakeClient:
     def governance_proposal(self, proposal_id):
         return {"proposal_id": str(proposal_id), "title": "Test", "summary": "Summary", "summary_truncated": False, "status": "PROPOSAL_STATUS_PASSED", "submit_time": "2026-11-01T00:00:00Z", "voting_start_time": "2026-11-02T00:00:00Z", "voting_end_time": "2026-11-10T00:00:00Z", "tally_kind": "final", "tally": {"yes_count": "10", "abstain_count": "0", "no_count": "1", "no_with_veto_count": "0"}}
 
+    def governance_parameters(self):
+        return {"quorum": "0.4", "threshold": "0.5", "veto_threshold": "0.334", "voting_period": "604800s",
+                "max_deposit_period": "1209600s", "min_deposit": [{"denom": "uluna", "amount": "5000000000000"}]}
+
     def transaction(self, tx_hash):
         return {"tx_hash": tx_hash, "height": "4", "code": 0, "timestamp": "now", "gas_wanted": "100", "gas_used": "80", "message_types": []}
 
     def explain_transaction(self, tx_hash):
         return {"tx_hash": tx_hash, "height": "4", "code": 0, "timestamp": "2026-11-16T00:00:00Z", "gas_limit": "100",
-                "fee": [], "memo": "", "memo_truncated": False, "messages": []}
+                "fee": [], "memo": "", "memo_truncated": False, "failure_log": None, "failure_log_truncated": False, "messages": []}
 
     def ibc_transfer_transaction(self, tx_hash):
         return {"tx_hash": tx_hash, "tx_code": 0, "packets": [{"sequence": 7, "source_channel": "channel-1", "destination_channel": "channel-2"}]}
@@ -145,10 +154,15 @@ def test_in_process_mcp_tools_and_schemas():
             assert supply.structured_content["supply_base_units"] == "100000000"
             grants = await client.call_tool("terra_get_authz_grants_received", {"address": ADDRESS})
             assert grants.structured_content["grants"] == []
+            overview = await client.call_tool("terra_get_account_overview", {"address": ADDRESS})
+            assert overview.structured_content["has_more"] is False
+            gov_params = await client.call_tool("terra_get_governance_parameters")
+            assert gov_params.structured_content["quorum"] == "0.4"
             transaction = await client.call_tool("terra_get_transaction", {"tx_hash": "a" * 64})
             assert transaction.structured_content["tx_hash"] == "A" * 64
             explained = await client.call_tool("terra_explain_transaction", {"tx_hash": "a" * 64})
             assert explained.structured_content["gas_limit"] == "100"
+            assert explained.structured_content["failure_log"] is None
             ibc_tx = await client.call_tool("terra_get_ibc_transfer_transaction", {"tx_hash": "a" * 64})
             assert ibc_tx.structured_content["packets"][0]["sequence"] == 7
             packet = await client.call_tool("terra_get_ibc_packet_observation", {"channel_id": "channel-1", "sequence": 7, "local_role": "source"})
@@ -169,6 +183,8 @@ def test_in_process_mcp_tools_and_schemas():
             assert invalid_status.is_error is True
             invalid_governance_page = await client.call_tool("terra_get_governance_proposals", {"page_key": "../bad"})
             assert invalid_governance_page.is_error is True
+            invalid_overview_limit = await client.call_tool("terra_get_account_overview", {"address": ADDRESS, "limit": 11})
+            assert invalid_overview_limit.is_error is True
             invalid_id = await client.call_tool("terra_get_governance_proposal", {"proposal_id": 0})
             assert invalid_id.is_error is True
             extra = await client.call_tool("terra_get_chain_status", {"url": "https://other.example"})
@@ -332,12 +348,13 @@ def test_http_expensive_tool_quota(http_auth, monkeypatch):
         assert client.post("/mcp", json=payload, headers=headers).status_code == 429
 
 
-def test_http_new_paged_reads_share_expensive_quota(http_auth, monkeypatch):
+@pytest.mark.parametrize("second_name", ["terra_get_authz_grants_received", "terra_get_account_overview"])
+def test_http_new_paged_reads_share_expensive_quota(http_auth, monkeypatch, second_name):
     monkeypatch.setenv("TERRA_CLASSIC_MCP_MAX_EXPENSIVE_PER_MINUTE", "1")
     headers = {"Accept": "application/json, text/event-stream", **http_auth}
     with TestClient(build_http_app(), base_url="http://localhost:8000") as client:
         first = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "terra_get_validator_page", "arguments": {"page": 0}}}
-        second = {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "terra_get_authz_grants_received", "arguments": {"address": ADDRESS}}}
+        second = {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": second_name, "arguments": {"address": ADDRESS}}}
         assert client.post("/mcp", json=first, headers=headers).status_code == 200
         assert client.post("/mcp", json=second, headers=headers).status_code == 429
 

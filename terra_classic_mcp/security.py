@@ -227,6 +227,7 @@ class HTTPGuard:
             await self._reply(send, 403, "Tool is not permitted for this client")
             return
         if tool in {"terra_get_validators", "terra_get_validator_page", "terra_get_burn_snapshot",
+                    "terra_get_account_overview",
                     "terra_get_authz_grants_received", "terra_explain_transaction",
                     "terra_query_contract", "terra_get_cw20_token_info",
                     "terra_get_cw20_balance", "terra_compare_chain_status", "terra_compare_balance",

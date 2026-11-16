@@ -1,6 +1,6 @@
 # Connect a client
 
-The server offers the same 23 tools to every MCP client, but each HTTP client's Bearer token permits only its configured subset. Install the Python project first as described in the [README](../README.md), and create client credentials as described in [HTTP deployment](deployment.md). Configure the client to send `Authorization: Bearer <its-token>` when it supports static Bearer authentication. If it requires OAuth, use an OAuth gateway that validates the client and injects a separate backend token. Keep tokens out of chat prompts and MCP tool arguments. Local `stdio` needs no HTTP token. For remote clients, replace `https://YOUR_DOMAIN/mcp` with your deployed HTTPS endpoint. A GitHub repository URL is not an MCP endpoint.
+The server offers the same 25 tools to every MCP client, but each HTTP client's Bearer token permits only its configured subset. Install the Python project first as described in the [README](../README.md), and create client credentials as described in [HTTP deployment](deployment.md). Configure the client to send `Authorization: Bearer <its-token>` when it supports static Bearer authentication. If it requires OAuth, use an OAuth gateway that validates the client and injects a separate backend token. Keep tokens out of chat prompts and MCP tool arguments. Local `stdio` needs no HTTP token. For remote clients, replace `https://YOUR_DOMAIN/mcp` with your deployed HTTPS endpoint. A GitHub repository URL is not an MCP endpoint.
 
 ## Open WebUI
 
@@ -84,12 +84,15 @@ Use one of these connection forms:
 - `stdio`: executable `/absolute/path/to/.venv/bin/python`, argument `/absolute/path/to/mcp-terra-classic/server.py`.
 - Streamable HTTP: `https://YOUR_DOMAIN/mcp`, or `http://127.0.0.1:8000/mcp` from the same machine.
 
-After connection, list tools and check that all 23 `terra_` names appear before calling one. Tool discovery shows the full catalog, while each HTTP Bearer credential permits only its configured subset. The [MCP transport specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports) describes both transports.
+After connection, list tools and check that all 25 `terra_` names appear before calling one. Tool discovery shows the full catalog, while each HTTP Bearer credential permits only its configured subset. The [MCP transport specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports) describes both transports.
 
 ## Questions to try in ChatGPT, Open WebUI or Claude
 
 - “Use `terra_get_chain_status` to give me the current Terra Classic chain ID and latest verified block height.”
 - “Read all pages of the native balance of this public `terra1...` address. Get on-chain display decimals for `uluna`; leave unknown denoms in raw units.”
+- “Use `terra_get_account_overview` for this public account. Identify every section with another page before summarizing it.”
+- “Read `terra_get_governance_parameters` and give the current quorum, approval threshold and veto threshold as on-chain fractions.”
+- “Explain this included transaction by hash. If it contains `MsgMultiSend`, report the returned recipients and say whether any were truncated.”
 - “For this IBC transaction hash, show the local transaction result and any `send_packet` channel and sequence. Describe only what the local packet query observes.”
 - “Compare the latest block heads from the two configured LCDs. If the heights differ, say the comparison is inconclusive.”
 - “For this operator-allowlisted CW20 contract, show its contract-reported decimals and the raw balance of this public address.”

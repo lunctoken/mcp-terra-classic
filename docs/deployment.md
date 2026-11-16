@@ -23,6 +23,8 @@ Give the file restrictive permissions on the host (`chmod 600 /absolute/path/to/
 
 The example above grants an older, narrow tool subset. To permit the new read-only tools, add the exact names needed: `terra_get_tax_parameters`, `terra_get_burn_snapshot`, `terra_get_authz_grants_received`, `terra_explain_transaction`, and `terra_get_validator_page`. Existing Bearer token files do not gain these permissions automatically. These tools still cannot sign or broadcast transactions.
 
+Version 0.5.0 also adds `terra_get_account_overview` and `terra_get_governance_parameters`. Add either name explicitly to each existing client allowlist that should use it. The account overview makes five LCD reads and counts against the expensive-tool quota.
+
 The legacy unauthenticated HTTP behavior is available only when `TERRA_CLASSIC_MCP_AUTH_MODE=local` and the connecting peer IP is loopback. It is intended for an isolated single-machine setup and does not work for a different Docker container. A reverse proxy on the same host can appear as a loopback peer, so do not use this mode behind a public proxy.
 
 ## Publish an HTTPS endpoint
