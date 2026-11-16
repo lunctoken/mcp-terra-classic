@@ -1,4 +1,4 @@
-FROM python:3.12.16-slim-bookworm@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df AS builder
+FROM python:3.15.0-slim-bookworm@sha256:0e019bbdfb5d9874cb2389f1c2884b64aa2ac97c99960b5bc521cef978c0617d AS builder
 
 WORKDIR /app
 COPY pyproject.toml uv.lock README.md ./
@@ -8,7 +8,7 @@ RUN python -m pip install --no-cache-dir uv==0.13.8 \
     && UV_CACHE_DIR=/tmp/uv-cache uv sync --frozen --no-dev --no-editable \
     && rm -rf /tmp/uv-cache
 
-FROM python:3.12.16-slim-bookworm@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df
+FROM python:3.15.0-slim-bookworm@sha256:0e019bbdfb5d9874cb2389f1c2884b64aa2ac97c99960b5bc521cef978c0617d
 WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/http_server.py /app/http_server.py
