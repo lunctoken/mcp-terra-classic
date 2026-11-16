@@ -171,6 +171,60 @@ def test_transaction_is_bounded_summary():
     assert "logs" not in result
 
 
+def test_tax_parameters_validate_rates_and_prices():
+    opener = Opener([{"params": {"burn_tax_rate": "0.015000000000000000", "gas_prices": [{"denom": "uluna", "amount": "28.325"}]}}])
+    result = LcdClient(base_url="https://lcd.example", opener=opener).tax_parameters()
+    assert result["burn_tax_rate"] == "0.015000000000000000"
+    assert result["gas_prices"][0]["denom"] == "uluna"
+    assert opener.requests[0].full_url.endswith("/terra/tax/v1beta1/params")
+    for rate in ("1.1", "-0.1", "nan"):
+        with pytest.raises(TerraError, match="burn tax rate"):
+            LcdClient(base_url="https://lcd.example", opener=Opener([{"params": {"burn_tax_rate": rate, "gas_prices": []}}])).tax_parameters()
+
+
+def test_burn_snapshot_reads_complete_paged_supply():
+    opener = Opener([
+        {"supply": [{"denom": "uusd", "amount": "2"}], "pagination": {"next_key": "YQ=="}},
+        {"supply": [{"denom": "uluna", "amount": "123456789"}], "pagination": {"next_key": None}},
+        {"params": {"burn_tax_rate": "0.015", "gas_prices": []}},
+    ])
+    result = LcdClient(base_url="https://lcd.example", opener=opener).burn_snapshot()
+    assert result == {"denom": "uluna", "supply_base_units": "123456789", "burn_tax_rate": "0.015"}
+    assert "pagination.key=YQ%3D%3D" in opener.requests[1].full_url
+    with pytest.raises(TerraError, match="pagination"):
+        LcdClient(base_url="https://lcd.example", opener=Opener([{"supply": [{"denom": "uluna", "amount": "1"}]}])).burn_snapshot()
+
+
+def test_authz_received_grants_are_bounded_and_paginated():
+    grant = {"granter": ADDRESS, "authorization": {"@type": "/cosmos.authz.v1beta1.GenericAuthorization", "msg": "/cosmos.bank.v1beta1.MsgSend"}, "expiration": "2027-01-01T00:00:00Z"}
+    opener = Opener([{"grants": [grant], "pagination": {"next_key": "YQ=="}}])
+    client = LcdClient(base_url="https://lcd.example", opener=opener)
+    result = client.authz_grants_received(ADDRESS, limit=1)
+    assert result["grants"][0]["authorization_type"] == "/cosmos.authz.v1beta1.GenericAuthorization"
+    assert result["next_key"] == "YQ==" and result["has_more"] is True
+    assert "/grants/grantee/" + ADDRESS in opener.requests[0].full_url
+    with pytest.raises(TerraError, match="address"):
+        client.authz_grants_received(ADDRESS[:-1] + "q")
+    with pytest.raises(TerraError, match="too large"):
+        LcdClient(base_url="https://lcd.example", opener=Opener([{"grants": [{**grant, "authorization": {"@type": "/x", "msg": "x" * 513}}], "pagination": {"next_key": None}}])).authz_grants_received(ADDRESS)
+
+
+def test_transaction_explanation_extracts_known_fields_and_bounds_memo():
+    payload = {"tx_response": {"txhash": "A" * 64, "height": "4", "code": 0, "timestamp": "2026-11-16T00:00:00Z"},
+               "tx": {"body": {"memo": "m" * 300, "messages": [
+                   {"@type": "/cosmos.bank.v1beta1.MsgSend", "from_address": ADDRESS, "to_address": ADDRESS, "amount": [{"denom": "uluna", "amount": "100"}]},
+                   {"@type": "/custom.Msg", "secret": "not copied"}]},
+                   "auth_info": {"fee": {"amount": [{"denom": "uluna", "amount": "3"}], "gas_limit": "1000"}}}}
+    result = LcdClient(base_url="https://lcd.example", opener=Opener([payload])).explain_transaction("a" * 64)
+    assert result["messages"][0]["amount"] == [{"denom": "uluna", "amount": "100"}]
+    assert result["messages"][1]["kind"] == "other" and "secret" not in str(result)
+    assert result["memo_truncated"] is True and len(result["memo"]) == 256
+    assert result["fee"][0]["amount"] == "3"
+    bad = {**payload, "tx_response": {**payload["tx_response"], "txhash": "B" * 64}}
+    with pytest.raises(TerraError, match="transaction response"):
+        LcdClient(base_url="https://lcd.example", opener=Opener([bad])).explain_transaction("a" * 64)
+
+
 def test_validator_rank_uses_all_bonded_tokens():
     first = {"operator_address": "val1", "tokens": "100", "description": {"moniker": "One"}, "commission": {"commission_rates": {"rate": "0.05"}}}
     second = {"operator_address": "val2", "tokens": "300", "description": {"moniker": "Two"}, "commission": {"commission_rates": {"rate": "0.1"}}}
@@ -182,6 +236,12 @@ def test_validator_rank_uses_all_bonded_tokens():
     cached = LcdClient(base_url="https://lcd.example", opener=Opener([{"validators": [first, second], "pagination": {"next_key": ""}}]))
     assert len(cached.validators(limit=1)["validators"]) == 1
     assert len(cached.validators(limit=2)["validators"]) == 2
+    page = cached.validator_page(page=2, limit=1)
+    assert page["validators"][0]["moniker"] == "One"
+    assert page["next_page"] is None and page["validator_count"] == 2
+    assert cached.validator_page(page=1, limit=1)["next_page"] == 2
+    with pytest.raises(TerraError, match="page must"):
+        cached.validator_page(page=True)
 
 
 def test_delegations_use_validated_pagination():

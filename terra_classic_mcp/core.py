@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+from decimal import Decimal, InvalidOperation
 import hashlib
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -29,6 +30,7 @@ MAX_LCD_BYTES = 4 * 1024 * 1024
 MAX_CALL_SECONDS = 30
 CHAIN_STATUS_TTL_SECONDS = 10
 MAX_VALIDATOR_PAGES = 5
+MAX_SUPPLY_PAGES = 10
 EXPECTED_CHAIN_ID = "columbus-5"
 _deadline: ContextVar[float | None] = ContextVar("terra_lcd_deadline", default=None)
 TX_HASH_RE = re.compile(r"^[A-Fa-f0-9]{64}$")
@@ -37,6 +39,7 @@ DENOM_RE = re.compile(r"^[A-Za-z0-9/._:-]{1,128}$")
 IBC_DENOM_RE = re.compile(r"^ibc/[A-Fa-f0-9]{64}$")
 CHANNEL_RE = re.compile(r"^channel-[0-9]{1,12}$")
 AMOUNT_RE = re.compile(r"^[0-9]{1,78}(?:\.[0-9]{1,18})?$")
+INTEGER_AMOUNT_RE = re.compile(r"^[0-9]{1,78}$")
 PROPOSAL_STATUSES = {
     "all": "",
     "voting": "PROPOSAL_STATUS_VOTING_PERIOD",
@@ -528,6 +531,84 @@ class LcdClient:
             seen_cursors.add(cursor)
         raise TerraError("Balance comparison requires more than five LCD pages")
 
+    def tax_parameters(self) -> dict:
+        payload = self.request("/terra/tax/v1beta1/params", max_bytes=32 * 1024)
+        params = payload.get("params") if isinstance(payload, dict) else None
+        if not isinstance(params, dict):
+            raise TerraError("Invalid tax parameters")
+        rate = params.get("burn_tax_rate")
+        if not isinstance(rate, str) or not re.fullmatch(r"[0-9]{1,2}(?:\.[0-9]{1,18})?", rate):
+            raise TerraError("Invalid burn tax rate")
+        try:
+            if not Decimal(0) <= Decimal(rate) <= Decimal(1):
+                raise TerraError("Invalid burn tax rate")
+        except InvalidOperation as exc:
+            raise TerraError("Invalid burn tax rate") from exc
+        prices = _coins(params.get("gas_prices"))
+        if len(prices) > 100 or len({coin["denom"] for coin in prices}) != len(prices):
+            raise TerraError("Invalid tax gas prices")
+        return {"burn_tax_rate": rate, "gas_prices": prices}
+
+    def burn_snapshot(self) -> dict:
+        # The single-denomination supply route is not implemented on some Terra Classic LCDs.
+        cursor = ""
+        seen: set[str] = set()
+        uluna = None
+        for _ in range(MAX_SUPPLY_PAGES):
+            path = "/cosmos/bank/v1beta1/supply?pagination.limit=100"
+            if cursor:
+                path += "&pagination.key=" + quote(cursor, safe="")
+            payload = self.request(path, max_bytes=128 * 1024)
+            if not isinstance(payload, dict) or not isinstance(payload.get("supply"), list) or len(payload["supply"]) > 100:
+                raise TerraError("Invalid bank supply response")
+            for coin in _coins(payload["supply"]):
+                if coin["denom"] == "uluna":
+                    if uluna is not None or not INTEGER_AMOUNT_RE.fullmatch(coin["amount"]):
+                        raise TerraError("Invalid uluna supply")
+                    uluna = coin["amount"]
+            next_key = next_page_key(payload, cursor)
+            if not next_key:
+                if uluna is None:
+                    raise TerraError("uluna not found in complete bank supply")
+                return {"denom": "uluna", "supply_base_units": uluna, "burn_tax_rate": self.tax_parameters()["burn_tax_rate"]}
+            if next_key in seen:
+                raise TerraError("Bank supply pagination cycle")
+            seen.add(next_key)
+            cursor = next_key
+        raise TerraError("Bank supply requires too many pages")
+
+    def authz_grants_received(self, address: str, limit: int = 20, page_key: str = "") -> dict:
+        address = require_account_address(address)
+        limit, page_key = require_page_limit(limit), require_page_key(page_key)
+        path = "/cosmos/authz/v1beta1/grants/grantee/" + quote(address, safe="") + f"?pagination.limit={limit}"
+        if page_key:
+            path += "&pagination.key=" + quote(page_key, safe="")
+        payload = self.request(path, max_bytes=128 * 1024)
+        if not isinstance(payload, dict) or not isinstance(payload.get("grants"), list) or len(payload["grants"]) > limit:
+            raise TerraError("Invalid authz grants response")
+        grants = []
+        for item in payload["grants"]:
+            if not isinstance(item, dict) or not isinstance(item.get("authorization"), dict):
+                raise TerraError("Invalid authz grant")
+            authorization = item["authorization"]
+            kind, granter, expiration = authorization.get("@type"), item.get("granter"), item.get("expiration")
+            if not isinstance(kind, str) or not re.fullmatch(r"/[A-Za-z0-9_.]{1,128}", kind):
+                raise TerraError("Invalid authz grant type")
+            granter = require_account_address(granter)
+            if not isinstance(expiration, str) or not 20 <= len(expiration) <= 50:
+                raise TerraError("Invalid authz grant expiration")
+            try:
+                if datetime.fromisoformat(expiration.replace("Z", "+00:00")).tzinfo is None:
+                    raise ValueError("missing timezone")
+            except ValueError as exc:
+                raise TerraError("Invalid authz grant expiration") from exc
+            validate_json_tree(authorization, max_depth=8, max_nodes=100, max_string=512)
+            if len(json.dumps(authorization, separators=(",", ":")).encode()) > 4096:
+                raise TerraError("Authz grant is too large")
+            grants.append({"granter": granter, "authorization_type": kind, "authorization": authorization, "expiration": expiration})
+        key = next_page_key(payload, page_key)
+        return {"grantee": address, "grants": grants, "next_key": key, "has_more": key is not None}
+
     def transaction(self, tx_hash: str) -> dict:
         payload = self.request("/cosmos/tx/v1beta1/txs/" + quote(tx_hash, safe=""))
         try:
@@ -548,6 +629,54 @@ class LcdClient:
         except (KeyError, TypeError) as exc:
             raise TerraError("Invalid transaction response") from exc
         return result
+
+    def explain_transaction(self, tx_hash: str) -> dict:
+        tx_hash = require_tx_hash(tx_hash)
+        payload = self.request("/cosmos/tx/v1beta1/txs/" + tx_hash, max_bytes=512 * 1024)
+        try:
+            response, body = payload["tx_response"], payload["tx"]["body"]
+            if require_tx_hash(response["txhash"]) != tx_hash or type(response["code"]) is not int or response["code"] < 0:
+                raise TerraError("Invalid transaction response")
+            messages = body["messages"]
+            if not isinstance(messages, list) or len(messages) > 50:
+                raise TerraError("Invalid transaction messages")
+            fee = payload["tx"]["auth_info"]["fee"]
+            fee_amount = _coins(fee["amount"])
+            if len(fee_amount) > 20 or any(not INTEGER_AMOUNT_RE.fullmatch(coin["amount"]) for coin in fee_amount):
+                raise TerraError("Invalid transaction fee")
+            gas_limit = fee["gas_limit"]
+            if not isinstance(gas_limit, str) or not INTEGER_AMOUNT_RE.fullmatch(gas_limit):
+                raise TerraError("Invalid transaction gas limit")
+            memo = body.get("memo", "")
+            if not isinstance(memo, str):
+                raise TerraError("Invalid transaction memo")
+            compact = []
+            for index, message in enumerate(messages):
+                if not isinstance(message, dict):
+                    raise TerraError("Invalid transaction message")
+                kind = message.get("@type")
+                if not isinstance(kind, str) or not re.fullmatch(r"/[A-Za-z0-9_.]{1,128}", kind):
+                    raise TerraError("Invalid transaction message type")
+                detail = {"index": index, "type_url": kind, "kind": "other", "addresses": [], "amount": [], "proposal_id": None, "vote_option": None}
+                if kind == "/cosmos.bank.v1beta1.MsgSend":
+                    detail.update(kind="bank_send", addresses=[require_address(message["from_address"]), require_address(message["to_address"])], amount=_coins(message["amount"]))
+                elif kind in {"/cosmos.staking.v1beta1.MsgDelegate", "/cosmos.staking.v1beta1.MsgUndelegate"}:
+                    validator = message["validator_address"]
+                    if not isinstance(validator, str) or not re.fullmatch(r"terravaloper1[023456789acdefghjklmnpqrstuvwxyz]{38}", validator):
+                        raise TerraError("Invalid transaction validator address")
+                    detail.update(kind="delegate" if kind.endswith("MsgDelegate") else "undelegate", addresses=[require_account_address(message["delegator_address"]), validator], amount=_coins([message["amount"]]))
+                elif kind in {"/cosmos.gov.v1.MsgVote", "/cosmos.gov.v1beta1.MsgVote"}:
+                    proposal_id, option = message["proposal_id"], message["option"]
+                    if not isinstance(proposal_id, str) or not re.fullmatch(r"[1-9][0-9]{0,18}", proposal_id) or not isinstance(option, str) or not re.fullmatch(r"VOTE_OPTION_[A-Z_]{1,32}", option):
+                        raise TerraError("Invalid transaction vote")
+                    detail.update(kind="vote", addresses=[require_account_address(message["voter"])], proposal_id=proposal_id, vote_option=option)
+                if len(detail["amount"]) > 20 or any(not INTEGER_AMOUNT_RE.fullmatch(coin["amount"]) for coin in detail["amount"]):
+                    raise TerraError("Invalid transaction amount")
+                compact.append(detail)
+            return {"tx_hash": tx_hash, "height": response["height"], "code": response["code"], "timestamp": response["timestamp"],
+                    "gas_limit": gas_limit, "fee": fee_amount, "memo": memo[:256], "memo_truncated": len(memo) > 256, "messages": compact}
+        except (KeyError, TypeError, IndexError) as exc:
+            raise TerraError("Invalid transaction response") from exc
 
     def ibc_transfer_transaction(self, tx_hash: str) -> dict:
         tx_hash = require_tx_hash(tx_hash)
@@ -663,12 +792,29 @@ class LcdClient:
         return {"contract": contract, "address": address, "balance": data["balance"]}
 
     def validators(self, limit: int = 10) -> dict:
+        if type(limit) is not int or not 1 <= limit <= 20:
+            raise TerraError("limit must be an integer between 1 and 20")
         self._check_status()
         with self._validators_lock:
             if self._cached_validators is None or time.monotonic() - self._validators_checked_at >= 10:
                 self._cached_validators = self._fetch_validators()
                 self._validators_checked_at = time.monotonic()
             return {**self._cached_validators, "validators": self._cached_validators["validators"][:limit]}
+
+    def validator_page(self, page: int = 1, limit: int = 20) -> dict:
+        if type(page) is not int or not 1 <= page <= 500:
+            raise TerraError("page must be an integer between 1 and 500")
+        limit = require_page_limit(limit)
+        self._check_status()
+        with self._validators_lock:
+            if self._cached_validators is None or time.monotonic() - self._validators_checked_at >= 10:
+                self._cached_validators = self._fetch_validators()
+                self._validators_checked_at = time.monotonic()
+            data = self._cached_validators
+            start = (page - 1) * limit
+            end = start + limit
+            return {"status": data["status"], "validator_count": data["validator_count"], "page": page, "limit": limit,
+                    "next_page": page + 1 if end < data["validator_count"] else None, "validators": data["validators"][start:end]}
 
     def _fetch_validators(self) -> dict:
         all_validators: list[dict] = []
@@ -695,7 +841,7 @@ class LcdClient:
             ranked = sorted(all_validators, key=lambda item: int(item["tokens"]), reverse=True)
             total_tokens = sum(int(item["tokens"]) for item in ranked)
             validators = []
-            for rank, item in enumerate(ranked[:20], 1):
+            for rank, item in enumerate(ranked, 1):
                 tokens = int(item["tokens"])
                 description = item.get("description") or {}
                 rate = (item.get("commission") or {}).get("commission_rates") or {}

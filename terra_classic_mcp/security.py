@@ -226,7 +226,9 @@ class HTTPGuard:
         if method == "tools/call" and tool not in tools:
             await self._reply(send, 403, "Tool is not permitted for this client")
             return
-        if tool in {"terra_get_validators", "terra_query_contract", "terra_get_cw20_token_info",
+        if tool in {"terra_get_validators", "terra_get_validator_page", "terra_get_burn_snapshot",
+                    "terra_get_authz_grants_received", "terra_explain_transaction",
+                    "terra_query_contract", "terra_get_cw20_token_info",
                     "terra_get_cw20_balance", "terra_compare_chain_status", "terra_compare_balance",
                     "terra_get_ibc_packet_observation"}:
             if not self._within_limit(self._expensive, client, self.max_expensive):

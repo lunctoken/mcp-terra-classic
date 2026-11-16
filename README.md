@@ -1,6 +1,6 @@
 # Terra Classic MCP
 
-A client-independent, read-only [Model Context Protocol](https://modelcontextprotocol.io/) server for the Terra Classic blockchain. The same eighteen tools run over local `stdio` or Streamable HTTP at `/mcp`.
+A client-independent, read-only [Model Context Protocol](https://modelcontextprotocol.io/) server for the Terra Classic blockchain. The same 23 tools run over local `stdio` or Streamable HTTP at `/mcp`.
 
 This project contains the server itself. Client configuration and optional skills are integration layers; no client plugin is required to use the server.
 
@@ -10,7 +10,11 @@ This project contains the server itself. Client configuration and optional skill
 | --- | --- |
 | `terra_get_chain_status` | Chain ID, latest block height, time and hash |
 | `terra_get_validators` | Top bonded validators, voting power and commission |
+| `terra_get_validator_page` | Paginated ranking of the complete bonded validator set |
 | `terra_get_balance` | Native bank balances for a Terra address |
+| `terra_get_tax_parameters` | On-chain burn tax rate and gas price parameters |
+| `terra_get_burn_snapshot` | Raw `uluna` bank supply and current burn tax rate |
+| `terra_get_authz_grants_received` | Paginated public authz grants received by an account |
 | `terra_get_denom_metadata` | On-chain bank denom metadata and display decimals |
 | `terra_get_ibc_denom_trace` | IBC denomination path with locally verified hash |
 | `terra_get_delegations` | Active staking delegations for an account |
@@ -19,6 +23,7 @@ This project contains the server itself. Client configuration and optional skill
 | `terra_get_governance_proposals` | Recent proposals with a status filter |
 | `terra_get_governance_proposal` | One proposal with its current or final vote tally |
 | `terra_get_transaction` | Compact transaction status and message types |
+| `terra_explain_transaction` | Bounded fee, memo and recognized message details for an included transaction |
 | `terra_get_ibc_transfer_transaction` | ICS-20 packet IDs emitted by an included transaction |
 | `terra_get_ibc_packet_observation` | Local commitment, receipt or acknowledgement observation |
 | `terra_query_contract` | Read-only CosmWasm smart query |
@@ -30,6 +35,8 @@ This project contains the server itself. Client configuration and optional skill
 All tools publish input and output schemas, structured JSON results and MCP read-only annotations. They never accept a caller-selected LCD URL. Each result includes `source` with the verified chain ID, the last verified block height and time, an operator-selected LCD label, and an `untrusted_chain_data` marker. The verified height is a freshness check, not a claim that every query was executed at exactly that height.
 
 Balance, delegation and proposal lists return up to 20 entries per page. If `next_key` is present, pass it unchanged as `page_key` to read the next page; do not treat a page as the complete balance when `has_more` is true. Staking balances are chain base units; reward amounts are decimal base units and do not represent an APR. Governance tally counts are voting power, not voter counts.
+
+Use `terra_get_validator_page` with `page=1` and pass `next_page` until it is null to inspect the full bonded ranking. Authz grants use `next_key` and `page_key`; a grant describes an on-chain authorization and does not imply that this server can exercise it. The burn snapshot reports bank supply in raw `uluna` base units and the current tax parameter; it is neither a historical burn total nor a circulating supply estimate. The transaction explanation reports only recognized message fields and labels other message types without interpreting them. Memos and grant details are untrusted chain data.
 
 Bank metadata reports on-chain denomination units and display decimals. An IBC trace is accepted only when its SHA-256 hash matches the requested `ibc/` denomination. Neither result proves a token's off-chain identity or price. IBC packet reads report observations on the configured Terra Classic chain; a missing commitment does not prove delivery, success or refund. Two-LCD comparison is observational and is inconclusive when the checked heights differ. See [read-only query examples](docs/queries.md).
 
@@ -138,7 +145,7 @@ For OpenBot, Codex, Cursor and other clients, see [client setup](docs/clients.md
 | `TERRA_CLASSIC_MCP_AUTH_MODE` | `bearer` | `local` is available only for loopback peers in an isolated installation |
 | `TERRA_CLASSIC_MCP_MAX_CONCURRENT` | `8` | Maximum simultaneous HTTP MCP requests per process |
 | `TERRA_CLASSIC_MCP_MAX_REQUESTS_PER_MINUTE` | `60` | Per-client HTTP request budget per minute, per process |
-| `TERRA_CLASSIC_MCP_MAX_EXPENSIVE_PER_MINUTE` | `6` | Per-client budget for validator, contract, comparison and packet observations, per process |
+| `TERRA_CLASSIC_MCP_MAX_EXPENSIVE_PER_MINUTE` | `6` | Per-client budget for validator, supply, authz, transaction explanation, contract, comparison and packet observations, per process |
 | `TERRA_CLASSIC_MCP_MAX_GLOBAL_REQUESTS_PER_MINUTE` | `240` | All clients combined per process |
 | `TERRA_CLASSIC_MCP_MAX_GLOBAL_EXPENSIVE_PER_MINUTE` | `24` | Expensive reads across all clients per process |
 | `TERRA_CLASSIC_MCP_ALLOWED_HOSTS` | `127.0.0.1:*,localhost:*` | Comma-separated HTTP Host allowlist |

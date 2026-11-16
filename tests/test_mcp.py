@@ -14,11 +14,12 @@ from terra_classic_mcp.core import LcdClient
 ADDRESS = "terra18vd8fpwxzck93qlwghaj6arh4p7c5n896xzem5"
 ROOT = Path(__file__).resolve().parents[1]
 NAMES = [
-    "terra_get_chain_status", "terra_get_validators", "terra_get_balance",
+    "terra_get_chain_status", "terra_get_validators", "terra_get_validator_page", "terra_get_balance",
+    "terra_get_tax_parameters", "terra_get_burn_snapshot", "terra_get_authz_grants_received",
     "terra_get_denom_metadata", "terra_get_ibc_denom_trace",
     "terra_get_delegations", "terra_get_unbonding_delegations", "terra_get_staking_rewards",
     "terra_get_governance_proposals", "terra_get_governance_proposal",
-    "terra_get_transaction", "terra_get_ibc_transfer_transaction", "terra_get_ibc_packet_observation",
+    "terra_get_transaction", "terra_explain_transaction", "terra_get_ibc_transfer_transaction", "terra_get_ibc_packet_observation",
     "terra_query_contract", "terra_get_cw20_token_info", "terra_get_cw20_balance",
     "terra_compare_chain_status", "terra_compare_balance",
 ]
@@ -40,6 +41,18 @@ class FakeClient:
 
     def validators(self, limit=10):
         return {"status": "BOND_STATUS_BONDED", "validator_count": 1, "validators": [{"rank": 1, "moniker": "One", "operator_address": "val1", "tokens": "100", "voting_power_pct": 100.0, "commission_rate_pct": 5.0, "jailed": False, "website": ""}]}
+
+    def validator_page(self, page=1, limit=20):
+        return {**self.validators(limit), "page": page, "limit": limit, "next_page": None}
+
+    def tax_parameters(self):
+        return {"burn_tax_rate": "0.015", "gas_prices": [{"denom": "uluna", "amount": "28.325"}]}
+
+    def burn_snapshot(self):
+        return {"denom": "uluna", "supply_base_units": "100000000", "burn_tax_rate": "0.015"}
+
+    def authz_grants_received(self, address, limit=20, page_key=""):
+        return {"grantee": address, "grants": [], "next_key": None, "has_more": False}
 
     def balance(self, address, limit=20, page_key=""):
         return {"address": address, "balances": [], "next_key": None, "has_more": False}
@@ -69,6 +82,10 @@ class FakeClient:
 
     def transaction(self, tx_hash):
         return {"tx_hash": tx_hash, "height": "4", "code": 0, "timestamp": "now", "gas_wanted": "100", "gas_used": "80", "message_types": []}
+
+    def explain_transaction(self, tx_hash):
+        return {"tx_hash": tx_hash, "height": "4", "code": 0, "timestamp": "2026-11-16T00:00:00Z", "gas_limit": "100",
+                "fee": [], "memo": "", "memo_truncated": False, "messages": []}
 
     def ibc_transfer_transaction(self, tx_hash):
         return {"tx_hash": tx_hash, "tx_code": 0, "packets": [{"sequence": 7, "source_channel": "channel-1", "destination_channel": "channel-2"}]}
@@ -120,8 +137,18 @@ def test_in_process_mcp_tools_and_schemas():
             assert proposal.structured_content["tally_kind"] == "final"
             validators = await client.call_tool("terra_get_validators", {"limit": 1})
             assert validators.structured_content["validators"][0]["moniker"] == "One"
+            ranked = await client.call_tool("terra_get_validator_page", {"page": 1, "limit": 1})
+            assert ranked.structured_content["next_page"] is None
+            tax = await client.call_tool("terra_get_tax_parameters")
+            assert tax.structured_content["burn_tax_rate"] == "0.015"
+            supply = await client.call_tool("terra_get_burn_snapshot")
+            assert supply.structured_content["supply_base_units"] == "100000000"
+            grants = await client.call_tool("terra_get_authz_grants_received", {"address": ADDRESS})
+            assert grants.structured_content["grants"] == []
             transaction = await client.call_tool("terra_get_transaction", {"tx_hash": "a" * 64})
             assert transaction.structured_content["tx_hash"] == "A" * 64
+            explained = await client.call_tool("terra_explain_transaction", {"tx_hash": "a" * 64})
+            assert explained.structured_content["gas_limit"] == "100"
             ibc_tx = await client.call_tool("terra_get_ibc_transfer_transaction", {"tx_hash": "a" * 64})
             assert ibc_tx.structured_content["packets"][0]["sequence"] == 7
             packet = await client.call_tool("terra_get_ibc_packet_observation", {"channel_id": "channel-1", "sequence": 7, "local_role": "source"})
@@ -303,6 +330,16 @@ def test_http_expensive_tool_quota(http_auth, monkeypatch):
         payload = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "terra_query_contract", "arguments": {}}}
         assert client.post("/mcp", json=payload, headers=headers).status_code == 200
         assert client.post("/mcp", json=payload, headers=headers).status_code == 429
+
+
+def test_http_new_paged_reads_share_expensive_quota(http_auth, monkeypatch):
+    monkeypatch.setenv("TERRA_CLASSIC_MCP_MAX_EXPENSIVE_PER_MINUTE", "1")
+    headers = {"Accept": "application/json, text/event-stream", **http_auth}
+    with TestClient(build_http_app(), base_url="http://localhost:8000") as client:
+        first = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "terra_get_validator_page", "arguments": {"page": 0}}}
+        second = {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "terra_get_authz_grants_received", "arguments": {"address": ADDRESS}}}
+        assert client.post("/mcp", json=first, headers=headers).status_code == 200
+        assert client.post("/mcp", json=second, headers=headers).status_code == 429
 
 
 def test_http_global_quota(http_auth, monkeypatch):

@@ -21,6 +21,8 @@ Generate a different random token for each client. Run `python3 -c 'import secre
 
 Give the file restrictive permissions on the host (`chmod 600 /absolute/path/to/mcp-tokens.json`) and keep it out of Git, backups shared with clients, and application logs. Set `TERRA_CLASSIC_MCP_TOKENS_FILE` to its absolute path. The Docker Compose file mounts this file as a read-only secret. Rotate a token by replacing its value and restarting the server. A client can call only the tools in its explicit allowlist; it may still see the server's full tool catalog during discovery.
 
+The example above grants an older, narrow tool subset. To permit the new read-only tools, add the exact names needed: `terra_get_tax_parameters`, `terra_get_burn_snapshot`, `terra_get_authz_grants_received`, `terra_explain_transaction`, and `terra_get_validator_page`. Existing Bearer token files do not gain these permissions automatically. These tools still cannot sign or broadcast transactions.
+
 The legacy unauthenticated HTTP behavior is available only when `TERRA_CLASSIC_MCP_AUTH_MODE=local` and the connecting peer IP is loopback. It is intended for an isolated single-machine setup and does not work for a different Docker container. A reverse proxy on the same host can appear as a loopback peer, so do not use this mode behind a public proxy.
 
 ## Publish an HTTPS endpoint

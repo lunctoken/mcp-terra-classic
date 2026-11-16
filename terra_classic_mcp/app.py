@@ -108,6 +108,55 @@ class Transaction(Result):
     message_types: list[str]
 
 
+class TaxParameters(Result):
+    burn_tax_rate: Annotated[str, Field(pattern=r"^[0-9]{1,2}(?:\.[0-9]{1,18})?$")]
+    gas_prices: Annotated[list[Coin], Field(max_length=100)]
+
+
+class BurnSnapshot(Result):
+    denom: Literal["uluna"]
+    supply_base_units: Annotated[str, Field(pattern=r"^[0-9]{1,78}$")]
+    burn_tax_rate: Annotated[str, Field(pattern=r"^[0-9]{1,2}(?:\.[0-9]{1,18})?$")]
+
+
+class AuthzGrant(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    granter: Annotated[str, Field(min_length=44, max_length=44)]
+    authorization_type: Annotated[str, Field(pattern=r"^/[A-Za-z0-9_.]{1,128}$")]
+    authorization: JsonValue
+    expiration: Annotated[str, Field(min_length=20, max_length=50)]
+
+
+class AuthzGrantsReceived(Result):
+    grantee: Annotated[str, Field(min_length=44, max_length=44)]
+    grants: Annotated[list[AuthzGrant], Field(max_length=20)]
+    next_key: Annotated[str, Field(max_length=512)] | None
+    has_more: bool
+
+
+class TransactionMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    index: Annotated[int, Field(ge=0, le=49)]
+    type_url: Annotated[str, Field(pattern=r"^/[A-Za-z0-9_.]{1,128}$")]
+    kind: Literal["bank_send", "delegate", "undelegate", "vote", "other"]
+    addresses: Annotated[list[str], Field(max_length=2)]
+    amount: Annotated[list[Coin], Field(max_length=20)]
+    proposal_id: Annotated[str, Field(pattern=r"^[1-9][0-9]{0,18}$")] | None
+    vote_option: Annotated[str, Field(pattern=r"^VOTE_OPTION_[A-Z_]{1,32}$")] | None
+
+
+class TransactionExplanation(Result):
+    tx_hash: Annotated[str, Field(pattern=r"^[A-F0-9]{64}$")]
+    height: Annotated[str, Field(pattern=r"^[1-9][0-9]{0,19}$")]
+    code: Annotated[int, Field(ge=0)]
+    timestamp: Annotated[str, Field(min_length=20, max_length=50)]
+    gas_limit: Annotated[str, Field(pattern=r"^[0-9]{1,78}$")]
+    fee: Annotated[list[Coin], Field(max_length=20)]
+    memo: Annotated[str, Field(max_length=256)]
+    memo_truncated: bool
+    messages: Annotated[list[TransactionMessage], Field(max_length=50)]
+
+
 class IbcPacketInTransaction(BaseModel):
     model_config = ConfigDict(extra="forbid")
     sequence: Annotated[int, Field(ge=1, le=9223372036854775807)]
@@ -183,6 +232,15 @@ class Validators(Result):
     status: str
     validator_count: int
     validators: list[Validator]
+
+
+class ValidatorPage(Result):
+    status: Literal["BOND_STATUS_BONDED"]
+    validator_count: Annotated[int, Field(ge=0, le=500)]
+    page: Annotated[int, Field(ge=1, le=500)]
+    limit: Annotated[int, Field(ge=1, le=20)]
+    next_page: Annotated[int, Field(ge=2, le=500)] | None
+    validators: Annotated[list[Validator], Field(max_length=20)]
 
 
 class Delegation(Result):
@@ -266,7 +324,11 @@ READ_ONLY = ToolAnnotations(
 ALLOWED_ARGUMENTS = {
     "terra_get_chain_status": frozenset(),
     "terra_get_validators": frozenset({"limit"}),
+    "terra_get_validator_page": frozenset({"page", "limit"}),
     "terra_get_balance": frozenset({"address", "limit", "page_key"}),
+    "terra_get_tax_parameters": frozenset(),
+    "terra_get_burn_snapshot": frozenset(),
+    "terra_get_authz_grants_received": frozenset({"address", "limit", "page_key"}),
     "terra_get_denom_metadata": frozenset({"denom"}),
     "terra_get_ibc_denom_trace": frozenset({"denom"}),
     "terra_get_delegations": frozenset({"address", "limit", "page_key"}),
@@ -275,6 +337,7 @@ ALLOWED_ARGUMENTS = {
     "terra_get_governance_proposals": frozenset({"status", "limit", "page_key"}),
     "terra_get_governance_proposal": frozenset({"proposal_id"}),
     "terra_get_transaction": frozenset({"tx_hash"}),
+    "terra_explain_transaction": frozenset({"tx_hash"}),
     "terra_get_ibc_transfer_transaction": frozenset({"tx_hash"}),
     "terra_get_ibc_packet_observation": frozenset({"channel_id", "sequence", "local_role"}),
     "terra_query_contract": frozenset({"contract", "query_msg"}),
@@ -366,6 +429,17 @@ def build_server(client: LcdClient | None = None, secondary_client: LcdClient | 
         return read(lambda: lcd.validators(limit), Validators)
 
     @server.tool(
+        title="Terra Classic validator ranking page",
+        description="Read a page of 1–20 bonded validators ranked across the complete bonded set. Pass next_page to continue.",
+        annotations=READ_ONLY,
+    )
+    def terra_get_validator_page(
+        page: Annotated[int, Field(strict=True, ge=1, le=500, description="One-based ranking page")] = 1,
+        limit: Annotated[int, Field(strict=True, ge=1, le=20, description="Validators per page")] = 20,
+    ) -> ValidatorPage:
+        return read(lambda: lcd.validator_page(page, limit), ValidatorPage)
+
+    @server.tool(
         title="Terra Classic native balances",
         description="Read one page of native bank balances. Pass next_key as page_key to continue; has_more signals incomplete balances.",
         annotations=READ_ONLY,
@@ -376,6 +450,22 @@ def build_server(client: LcdClient | None = None, secondary_client: LcdClient | 
         page_key: Annotated[str, Field(max_length=512, description="Opaque next_key from a previous response; empty for first page")] = "",
     ) -> Balance:
         return read(lambda: lcd.balance(require_address(address), require_page_limit(limit), require_page_key(page_key)), Balance)
+
+    @server.tool(title="Terra Classic tax parameters", description="Read the on-chain burn tax rate and gas price parameters; this does not estimate a transaction fee.", annotations=READ_ONLY)
+    def terra_get_tax_parameters() -> TaxParameters:
+        return read(lcd.tax_parameters, TaxParameters)
+
+    @server.tool(title="Terra Classic uluna supply snapshot", description="Read the raw on-chain uluna supply and burn tax rate. This is not a historical burn counter or a circulating supply estimate.", annotations=READ_ONLY)
+    def terra_get_burn_snapshot() -> BurnSnapshot:
+        return read(lcd.burn_snapshot, BurnSnapshot)
+
+    @server.tool(title="Terra Classic received authz grants", description="Read one bounded page of authorization grants received by a public account. Grant details are untrusted on-chain data.", annotations=READ_ONLY)
+    def terra_get_authz_grants_received(
+        address: Annotated[str, Field(min_length=44, max_length=44, description="Grantee terra1 account address")],
+        limit: Annotated[int, Field(strict=True, ge=1, le=20, description="Grants per page")] = 20,
+        page_key: Annotated[str, Field(max_length=512, description="Opaque next_key from the prior page")] = "",
+    ) -> AuthzGrantsReceived:
+        return read(lambda: lcd.authz_grants_received(require_account_address(address), require_page_limit(limit), require_page_key(page_key)), AuthzGrantsReceived)
 
     @server.tool(
         title="Terra Classic denomination metadata",
@@ -462,6 +552,12 @@ def build_server(client: LcdClient | None = None, secondary_client: LcdClient | 
         tx_hash: Annotated[str, Field(pattern=r"^[A-Fa-f0-9]{64}$", description="Transaction hash")],
     ) -> Transaction:
         return read(lambda: lcd.transaction(require_tx_hash(tx_hash)), Transaction)
+
+    @server.tool(title="Terra Classic transaction explanation", description="Read a bounded structured explanation of an included transaction, including fee, memo and recognized message fields. Unknown messages are identified only by type; no transaction is constructed.", annotations=READ_ONLY)
+    def terra_explain_transaction(
+        tx_hash: Annotated[str, Field(pattern=r"^[A-Fa-f0-9]{64}$", description="Transaction hash")],
+    ) -> TransactionExplanation:
+        return read(lambda: lcd.explain_transaction(require_tx_hash(tx_hash)), TransactionExplanation)
 
     @server.tool(
         title="Terra Classic IBC transfer transaction",
